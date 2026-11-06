@@ -387,13 +387,13 @@ class LowPowerControlChannel:
             res = subprocess.run(
                 ["arp", "-a"],
                 capture_output=True,
-                timeout=1.5,
+                timeout=3.5,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             text = (res.stdout or b"").decode("ascii", errors="ignore")
             for line in text.splitlines():
                 parts = line.split()
-                if len(parts) >= 3:
+                if len(parts) >= 2:
                     ip = parts[0]
                     if (ip.startswith("192.168.137.") or ip.startswith("192.168.49.")) and not ip.endswith(".1") and not ip.endswith(".255"):
                         peers.append(ip)
