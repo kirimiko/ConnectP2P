@@ -545,11 +545,11 @@ class WifiP2pBurstManager(
                                 }
                                 onConnectedToGo(goIp, info.isGroupOwner)
                             } else {
-                                @Suppress("DEPRECATION")
-                                val netInfo = intent.getParcelableExtra<NetworkInfo>(WifiP2pManager.EXTRA_NETWORK_INFO)
-                                if (netInfo?.isConnected == false) {
+                                if (activeGroupSsid != null || currentGoIp != null) {
                                     clearActiveState()
                                     onDisconnected()
+                                } else {
+                                    isConnectingOrConnected = false
                                 }
                             }
                         }

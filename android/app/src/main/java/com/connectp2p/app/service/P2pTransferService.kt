@@ -92,6 +92,9 @@ class P2pTransferService : Service() {
         private set
 
     @Volatile
+    private var pendingP2pPeer: P2pProtocol.PeerInfo? = null
+
+    @Volatile
     var isManuallyDisconnected: Boolean = false
         private set
 
@@ -160,10 +163,22 @@ class P2pTransferService : Service() {
                 emitLog("[Wi-Fi直连已建立] GO IP=$goIp (${if (isGo) "本机为热点GO" else "已连上对端GO"})")
                 powerPolicy.touchBurstActivity(timeoutMs = 120_000L)
                 announcePresenceHello(targetIp = if (!isGo) goIp else null)
-                // Automatically sync clipboard right after P2P connection forms
-                android.os.Handler(mainLooper).postDelayed({
-                    clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
-                }, 400L)
+                if (!isGo) {
+                    val pending = pendingP2pPeer
+                    if (pending != null && !isTrustedPeer(pending)) {
+                        emitLog("[正在请求授权] Wi-Fi直连已接通，正在请求 ${pending.deviceName} ($goIp) 同意连接...")
+                        sendPairRequestFrame(goIp, null, P2pProtocol.DATA_TCP_PORT)
+                    } else {
+                        sendPairRequestFrame(goIp, pending?.deviceId, P2pProtocol.DATA_TCP_PORT)
+                        android.os.Handler(mainLooper).postDelayed({
+                            clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
+                        }, 400L)
+                    }
+                } else {
+                    android.os.Handler(mainLooper).postDelayed({
+                        clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
+                    }, 400L)
+                }
             },
             onPeersDiscovered = { p2pDevices ->
                 for (dev in p2pDevices) {
@@ -179,15 +194,18 @@ class P2pTransferService : Service() {
                     ) {
                         continue
                     }
+                    // Primary category 1 = Computer (Windows PC)!
+                    val isWinPc = pType.startsWith("1-") || rawName.contains("WIN", ignoreCase = true) || rawName.contains("PC", ignoreCase = true)
                     val (friendlyName, isAuto) = P2pProtocol.decodeP2pSsid(rawName)
                     val peer = P2pProtocol.PeerInfo(
                         deviceId = "p2pdev-$addr",
                         deviceName = friendlyName,
-                        platform = "android",
-                        ip = P2pProtocol.ANDROID_GO_DEFAULT_IP,
+                        platform = if (isWinPc) "windows" else "android",
+                        ip = if (isWinPc) P2pProtocol.WINDOWS_GO_DEFAULT_IP else P2pProtocol.ANDROID_GO_DEFAULT_IP,
                         p2pDeviceAddress = addr,
                         p2pSsid = if (rawName.startsWith("DIRECT-")) rawName else null,
                         p2pPassphrase = if (isAuto) P2pProtocol.deriveP2pPassphrase(rawName) else null,
+                        p2pGoIp = if (isWinPc) P2pProtocol.WINDOWS_GO_DEFAULT_IP else P2pProtocol.ANDROID_GO_DEFAULT_IP,
                         discoverySource = "p2p_peer"
                     )
                     upsertPeer(peer)
@@ -542,6 +560,7 @@ class P2pTransferService : Service() {
 
         when {
             peer.discoverySource == "p2p_scan" && !peer.p2pSsid.isNullOrEmpty() -> {
+                pendingP2pPeer = peer
                 val ssid = peer.p2pSsid!!
                 val pass = peer.p2pPassphrase ?: P2pProtocol.deriveP2pPassphrase(ssid)
                 val goIp = peer.p2pGoIp ?: peer.ip ?: P2pProtocol.WINDOWS_GO_DEFAULT_IP
@@ -556,10 +575,12 @@ class P2pTransferService : Service() {
                 }
             }
             peer.discoverySource == "p2p_peer" && !peer.p2pDeviceAddress.isNullOrEmpty() -> {
+                pendingP2pPeer = peer
                 if (!peer.p2pSsid.isNullOrEmpty()) {
                     val ssid = peer.p2pSsid!!
                     val pass = peer.p2pPassphrase ?: P2pProtocol.deriveP2pPassphrase(ssid)
-                    connectToPeerBurstGroup(ssid, pass, P2pProtocol.ANDROID_GO_DEFAULT_IP, isManualUserClick = isManualUserClick)
+                    val goIp = peer.p2pGoIp ?: peer.ip ?: P2pProtocol.ANDROID_GO_DEFAULT_IP
+                    connectToPeerBurstGroup(ssid, pass, goIp, isManualUserClick = isManualUserClick)
                 } else {
                     emitLog("[一键P2P连接] 正在连接附近设备 ${peer.deviceName}...")
                     powerPolicy.onHandshakeStarted()
@@ -793,10 +814,18 @@ class P2pTransferService : Service() {
             isNewOrChanged = true
             discoveredPeers[peer.deviceId] = peer
         }
-        // Clean up duplicate scan placeholder if real device ID was discovered
+        // Clean up duplicate scan / P2P placeholders if real device ID was discovered
         peer.p2pSsid?.let { ssid ->
             if (peer.deviceId != "p2p-$ssid") {
                 discoveredPeers.remove("p2p-$ssid")
+            }
+        }
+        if (!peer.deviceId.startsWith("p2p") && peer.ip == P2pProtocol.WINDOWS_GO_DEFAULT_IP) {
+            val staleIds = discoveredPeers.values
+                .filter { it.deviceId.startsWith("p2p") && it.ip == P2pProtocol.WINDOWS_GO_DEFAULT_IP }
+                .map { it.deviceId }
+            for (sid in staleIds) {
+                discoveredPeers.remove(sid)
             }
         }
         serviceScope.launch {

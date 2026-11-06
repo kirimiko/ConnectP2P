@@ -19,11 +19,14 @@ Low-Power Guarantee:
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes as wintypes
 import logging
 import secrets
 import socket
 import string
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -322,32 +325,19 @@ try {{
         if creds:
             logger.info("Wi-Fi P2P link torn down (%s). Entered DEEP_IDLE state.", creds.ssid)
 
-    def scan_nearby_p2p_networks(self) -> list[PeerInfo]:
+    def scan_nearby_p2p_networks(self, trigger_active_scan: bool = False) -> list[PeerInfo]:
         """
-        Scan nearby Wi-Fi Direct (`DIRECT-*`) networks visible to the Windows WLAN adapter.
-        Automatically decodes ConnectP2P friendly nicknames (`DIRECT-CP-...`) and derives
-        their deterministic passphrase so the user can connect with a single click!
+        Scan nearby Wi-Fi Direct (`DIRECT-CP-*`) networks visible to the Windows WLAN adapter
+        using the Win32 Native Wi-Fi `WlanGetNetworkBssList` API (which includes Wi-Fi Direct
+        Group Owners that `netsh wlan show networks` hides!).
         """
         discovered: list[PeerInfo] = []
         own_ssid = self._active_creds.ssid if self._active_creds else None
-        try:
-            res = subprocess.run(
-                ["netsh", "wlan", "show", "networks", "mode=bssid"],
-                capture_output=True,
-                timeout=5,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            raw_bytes = res.stdout or b""
-            try:
-                output = raw_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                output = raw_bytes.decode("gbk", errors="replace")
+        seen_ssids: set[str] = set()
 
-            seen_ssids: set[str] = set()
-            for raw_line in output.splitlines():
-                line = raw_line.strip()
-                if line.startswith("SSID ") and ":" in line:
-                    ssid = line.split(":", 1)[1].strip()
+        if sys.platform == "win32":
+            try:
+                for ssid in self._scan_bss_ssids_win32(trigger_scan=trigger_active_scan):
                     if not ssid.startswith("DIRECT-CP-") or ssid == own_ssid or ssid in seen_ssids:
                         continue
                     seen_ssids.add(ssid)
@@ -366,9 +356,111 @@ try {{
                             discovery_source="p2p_scan",
                         )
                     )
-        except Exception as exc:
-            logger.debug("WLAN scan skipped: %s", exc)
+            except Exception as exc:
+                logger.debug("Win32 BSS scan skipped: %s", exc)
+
         return discovered
+
+    @staticmethod
+    def _scan_bss_ssids_win32(trigger_scan: bool = False) -> list[str]:
+        """Read raw 802.11 BSS table via `wlanapi.WlanGetNetworkBssList` (zero main Wi-Fi disruption)."""
+        ssids: list[str] = []
+        wlanapi = ctypes.windll.wlanapi
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class WLAN_INTERFACE_INFO(ctypes.Structure):
+            _fields_ = [
+                ("InterfaceGuid", GUID),
+                ("strInterfaceDescription", ctypes.c_wchar * 256),
+                ("isState", ctypes.c_int),
+            ]
+
+        class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+            _fields_ = [
+                ("dwNumberOfItems", wintypes.DWORD),
+                ("dwIndex", wintypes.DWORD),
+                ("InterfaceInfo", WLAN_INTERFACE_INFO * 1),
+            ]
+
+        class DOT11_SSID(ctypes.Structure):
+            _fields_ = [
+                ("uSSIDLength", wintypes.ULONG),
+                ("ucSSID", ctypes.c_ubyte * 32),
+            ]
+
+        class WLAN_BSS_ENTRY(ctypes.Structure):
+            _fields_ = [
+                ("dot11Ssid", DOT11_SSID),
+                ("uPhyId", wintypes.ULONG),
+                ("dot11Bssid", ctypes.c_ubyte * 6),
+                ("dot11BssType", ctypes.c_int),
+                ("dot11BssPhyType", ctypes.c_int),
+                ("lRssi", wintypes.LONG),
+                ("uLinkQuality", wintypes.ULONG),
+                ("bInRegDomain", wintypes.BOOLEAN),
+                ("usBeaconPeriod", wintypes.USHORT),
+                ("ullTimestamp", ctypes.c_ulonglong),
+                ("ullHostTimestamp", wintypes.ullonglong if hasattr(wintypes, "ullonglong") else ctypes.c_ulonglong),
+                ("usCapabilityInformation", wintypes.USHORT),
+                ("ulChCenterFrequency", wintypes.ULONG),
+                ("wlanRateSet", ctypes.c_byte * 256),
+                ("ulIeOffset", wintypes.ULONG),
+                ("ulIeSize", wintypes.ULONG),
+            ]
+
+        neg_ver = wintypes.DWORD()
+        client_handle = wintypes.HANDLE()
+        if wlanapi.WlanOpenHandle(2, None, ctypes.byref(neg_ver), ctypes.byref(client_handle)) != 0:
+            return ssids
+
+        p_if_list = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
+        try:
+            if wlanapi.WlanEnumInterfaces(client_handle, None, ctypes.byref(p_if_list)) != 0 or not p_if_list:
+                return ssids
+            count = p_if_list.contents.dwNumberOfItems
+            if count <= 0:
+                return ssids
+            guid = p_if_list.contents.InterfaceInfo[0].InterfaceGuid
+            if trigger_scan:
+                wlanapi.WlanScan(client_handle, ctypes.byref(guid), None, None, None)
+                time.sleep(0.35)
+
+            p_bss = ctypes.c_void_p()
+            res = wlanapi.WlanGetNetworkBssList(
+                client_handle,
+                ctypes.byref(guid),
+                None,
+                0,
+                False,
+                None,
+                ctypes.byref(p_bss),
+            )
+            if res == 0 and p_bss.value:
+                try:
+                    hdr = (wintypes.DWORD * 2).from_address(p_bss.value)
+                    num_items = hdr[1]
+                    arr = (WLAN_BSS_ENTRY * num_items).from_address(p_bss.value + 8)
+                    for i in range(num_items):
+                        entry = arr[i]
+                        length = min(32, int(entry.dot11Ssid.uSSIDLength))
+                        if length > 0:
+                            s = bytes(entry.dot11Ssid.ucSSID[:length]).decode("utf-8", errors="replace").strip()
+                            if s:
+                                ssids.append(s)
+                finally:
+                    wlanapi.WlanFreeMemory(p_bss)
+        finally:
+            if p_if_list:
+                wlanapi.WlanFreeMemory(p_if_list)
+            wlanapi.WlanCloseHandle(client_handle, None)
+        return ssids
 
     @staticmethod
     def _probe_tcp(host: str, port: int, timeout: float = 1.0) -> bool:

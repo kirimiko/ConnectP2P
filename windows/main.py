@@ -224,10 +224,20 @@ class ConnectP2pDesktopApp:
         if peer.ip:
             self.target_ip_var.set(peer.ip)
 
-        # If it's a legacy non-ConnectP2P DIRECT-* network without auto passphrase, ask for password once
-        if peer.discovery_source == "p2p_scan" and peer.p2p_ssid and not peer.p2p_passphrase:
-            if not peer.p2p_ssid.startswith("DIRECT-CP-"):
+        # If it's a scanned Android P2P hotspot (`p2p_scan`), warn the user before switching the laptop's main Wi-Fi!
+        if peer.discovery_source == "p2p_scan" and peer.p2p_ssid:
+            if not peer.p2p_passphrase and not peer.p2p_ssid.startswith("DIRECT-CP-"):
                 self._on_connect_android_go(prefill_ssid=peer.p2p_ssid)
+                return
+            ok_switch = messagebox.askyesno(
+                "连接模式提示 (推荐电脑开热点防断网)",
+                f"直接让电脑作为客户端连接手机热点「{peer.p2p_ssid}」会临时切换电脑的主 Wi-Fi 网卡（导致电脑外网暂时断开）。\n\n"
+                f"💡 强烈推荐【电脑不断网方案】：\n"
+                f"点击『否』，然后点电脑上方的『⚡ 开启本机热点』，在手机上扫描连接电脑——这样电脑和手机都不会断网！\n\n"
+                f"是否仍要切换电脑 Wi-Fi 连接该手机热点？",
+                parent=self.root,
+            )
+            if not ok_switch:
                 return
 
         threading.Thread(

@@ -708,17 +708,11 @@ class ConnectP2pWindowsNode:
         src_tag = "Wi-Fi直连热点" if peer.discovery_source == "p2p_scan" else f"在线 {peer.ip}:{peer.data_port}"
         self._emit_log(f"[发现设备] {peer.device_name}{trust_badge} [{peer.platform}] ({src_tag})")
 
-        # ONLY auto-connect if the peer is ALREADY a trusted (`★已信任`) device!
-        # Stranger devices must NEVER auto-connect without manual user approval.
+        # ONLY auto-connect on LAN/P2P virtual subnet (`discovery_source == 'lan'`) if the peer is ALREADY trusted!
+        # Do NOT auto-switch the laptop's main Wi-Fi card (`p2p_scan`) in the background, because switching
+        # the primary WLAN adapter to a phone's P2P hotspot would disconnect the laptop's internet Wi-Fi.
         if not self._manually_disconnected and not peer_disc and self.auto_reconnect_trusted and trusted:
-            if peer.discovery_source == "p2p_scan" and peer.p2p_ssid and not self.p2p_controller.is_active:
-                self._emit_log(f"[自动重连] 发现曾连接过的直连热点 {peer.device_name} ({peer.p2p_ssid})，正在自动连接...")
-                threading.Thread(
-                    target=self.connect_to_peer_and_sync,
-                    args=(peer,),
-                    daemon=True,
-                ).start()
-            elif peer.discovery_source == "lan":
+            if peer.discovery_source == "lan":
                 already_same = (
                     peer.is_connected
                     and self.connected_peer is not None
