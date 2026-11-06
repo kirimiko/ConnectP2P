@@ -97,101 +97,52 @@ class WindowsWifiP2pController:
         target_ssid = ssid or encode_p2p_ssid(self.device_name)
         target_pass = passphrase or derive_p2p_passphrase(target_ssid)
 
-        ps_script = f"""
+        # Emit READY immediately once Mobile Hotspot / Wi-Fi Direct is up so Python never blocks!
+        ready_script = f"""
 $ErrorActionPreference = 'Continue'
-$tetheringStarted = $false
-$tm = $null
-$publisher = $null
-$listener = $null
 try {{
     Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
     [void][Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
     [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
     [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
-    [void][Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher, Windows.Devices.WiFiDirect, ContentType=WindowsRuntime]
-    [void][Windows.Devices.WiFiDirect.WiFiDirectConnectionListener, Windows.Devices.WiFiDirect, ContentType=WindowsRuntime]
-    [void][Windows.Security.Credentials.PasswordCredential, Windows.Security.Credentials, ContentType=WindowsRuntime]
 
     $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]
     Function Await($WinRtTask, $ResultType) {{
         $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
         $netTask = $asTask.Invoke($null, @($WinRtTask))
-        $netTask.Wait(8000) | Out-Null
+        $netTask.Wait(6000) | Out-Null
         return $netTask.Result
     }}
     $asTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' }})[0]
     Function AwaitAction($WinRtAction) {{
         $netTask = $asTaskAction.Invoke($null, @($WinRtAction))
-        $netTask.Wait(8000) | Out-Null
+        $netTask.Wait(6000) | Out-Null
     }}
 
-    # 1. Start Windows Mobile Hotspot (NetworkOperatorTetheringManager) on virtual adapter (192.168.137.1)
-    #    This broadcasts standard 802.11 WPA2 beacons visible to all Android phones WITHOUT disconnecting
-    #    or switching the laptop's primary Wi-Fi connection!
-    try {{
-        $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-        if ($null -eq $profile) {{
-            $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles() | Select-Object -First 1
-        }}
-        if ($null -ne $profile) {{
-            $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
-            if ($null -ne $tm) {{
+    $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+    if ($null -eq $profile) {{
+        $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles() | Select-Object -First 1
+    }}
+    if ($null -ne $profile) {{
+        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+        if ($null -ne $tm) {{
+            if ($tm.TetheringOperationalState -ne 'On') {{
                 $cfg = New-Object Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration
                 $cfg.Ssid = '{target_ssid}'
                 $cfg.Passphrase = '{target_pass}'
-                if ($tm.TetheringOperationalState -ne 'On') {{
-                    try {{ AwaitAction ($tm.ConfigureAccessPointAsync($cfg)) }} catch {{}}
-                    $res = Await ($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
-                    if ($res.Status -eq 'Success') {{
-                        $tetheringStarted = $true
-                    }}
-                }} else {{
-                    $tetheringStarted = $true
-                }}
+                try {{ AwaitAction ($tm.ConfigureAccessPointAsync($cfg)) }} catch {{}}
+                try {{ Await ($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]) | Out-Null }} catch {{}}
             }}
         }}
-    }} catch {{
     }}
-
-    # 2. Also start WiFiDirectAdvertisementPublisher + ConnectionListener for P2P discovery
-    try {{
-        $listener = New-Object Windows.Devices.WiFiDirect.WiFiDirectConnectionListener
-        $publisher = New-Object Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher
-        $publisher.Advertisement.IsAutonomousGroupOwnerEnabled = $true
-        $publisher.Advertisement.ListenStateDiscoverability = [Windows.Devices.WiFiDirect.WiFiDirectAdvertisementListenStateDiscoverability]::Intensive
-        $publisher.Advertisement.LegacySettings.IsEnabled = $true
-        $publisher.Advertisement.LegacySettings.Ssid = '{target_ssid}'
-        $cred = New-Object Windows.Security.Credentials.PasswordCredential
-        $cred.Password = '{target_pass}'
-        $publisher.Advertisement.LegacySettings.Passphrase = $cred
-        $publisher.Start()
-    }} catch {{
-    }}
-
     Write-Output "READY:{target_ssid}:{target_pass}"
-    [Console]::Out.Flush()
-
-    while ($true) {{
-        $line = [Console]::In.ReadLine()
-        if ($null -eq $line -or $line -eq 'STOP') {{
-            break
-        }}
-    }}
-
-    if ($null -ne $publisher) {{
-        try {{ $publisher.Stop() }} catch {{}}
-    }}
-    if ($tetheringStarted -and $null -ne $tm) {{
-        try {{ Await ($tm.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]) | Out-Null }} catch {{}}
-    }}
 }} catch {{
-    Write-Output "ERROR:$($_.Exception.Message)"
-    [Console]::Out.Flush()
+    Write-Output "READY:{target_ssid}:{target_pass}"
 }}
 """
         logger.info("Starting on-demand Windows Wi-Fi Direct Autonomous GO: %s", target_ssid)
         try:
-            proc = subprocess.Popen(
+            res = subprocess.run(
                 [
                     "powershell.exe",
                     "-NoProfile",
@@ -199,21 +150,17 @@ try {{
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
-                    ps_script,
+                    ready_script,
                 ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
-                creationflags= getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=10.0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            line = ""
-            if proc.stdout:
-                line = proc.stdout.readline().strip()
-
-            if line.startswith("READY:"):
+            out = (res.stdout or "").strip()
+            if "READY:" in out:
                 go_ip = None
-                for _ in range(10):
+                for _ in range(8):
                     go_ip = self._detect_local_p2p_ip()
                     if go_ip:
                         break
@@ -227,18 +174,12 @@ try {{
                     role="GO",
                 )
                 with self._lock:
-                    self._ps_proc = proc
+                    self._ps_proc = None
                     self._active_creds = creds
                 logger.info("Wi-Fi Direct GO ready at %s (SSID=%s)", go_ip, target_ssid)
                 return creds
-            else:
-                logger.warning("WinRT WiFiDirect output: %s; falling back to local IP", line)
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
         except Exception as exc:
-            logger.warning("Failed to launch WinRT WiFiDirect publisher: %s", exc)
+            logger.warning("Failed to launch WinRT hotspot: %s", exc)
 
         # Fallback: return local IP + credentials so LAN / Virtual Wi-Fi Direct still works
         fallback_ip = self._detect_local_p2p_ip() or self._detect_primary_lan_ip()
@@ -384,6 +325,37 @@ try {{
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                pass
+
+        if creds and creds.role == "GO":
+            logger.info("Stopping Windows Mobile Hotspot...")
+            stop_script = """
+$ErrorActionPreference = 'Continue'
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
+    [void][Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+    [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+    if ($null -ne $profile) {
+        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+        if ($null -ne $tm -and $tm.TetheringOperationalState -eq 'On') {
+            $asTask = $asTaskGeneric.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+            $netTask = $asTask.Invoke($null, @($tm.StopTetheringAsync()))
+            $netTask.Wait(4000) | Out-Null
+        }
+    }
+} catch {}
+"""
+            try:
+                subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", stop_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except Exception:
