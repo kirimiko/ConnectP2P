@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import logging
 import queue
 import sys
@@ -530,9 +531,31 @@ def main() -> int:
     if args.cli or args.send_files or args.send_clipboard or args.start_go or args.connect_ssid:
         return run_cli(args)
 
+    # Single-instance guard for Windows GUI: prevent multiple instances from hijacking
+    # UDP 45820 / TCP 45821 (via SO_REUSEADDR) or causing clipboard echo loops.
+    mutex_handle = None
+    if sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        mutex_handle = kernel32.CreateMutexW(None, False, "Local\\ConnectP2P_Windows_GUI_Mutex")
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            hwnd = user32.FindWindowW(None, "ConnectP2P - 低功耗 Wi-Fi P2P 文件传输与剪贴板同步 (Windows 端)")
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+            user32.MessageBoxW(
+                0,
+                "ConnectP2P Windows 端已经在运行中！\n已为您切回正在运行的主窗口（避免多实例抢占端口与剪贴板冲突）。",
+                "ConnectP2P 已在运行",
+                0x00000040,  # MB_ICONINFORMATION
+            )
+            return 0
+
     root = tk.Tk()
     ConnectP2pDesktopApp(root)
     root.mainloop()
+    if mutex_handle and sys.platform == "win32":
+        ctypes.windll.kernel32.CloseHandle(mutex_handle)
     return 0
 
 
