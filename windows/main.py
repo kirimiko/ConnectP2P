@@ -51,8 +51,10 @@ class ConnectP2pDesktopApp:
         self.node.start()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._DrainUiQueue)
-        # Automatically scan for nearby devices on startup
+        # Automatically scan for nearby devices on startup; if not on same LAN, auto-enable virtual hotspot
+        # (which keeps the laptop's main Wi-Fi 100% connected) so the phone can connect anytime!
         self.root.after(400, self._on_scan_nearby)
+        self.root.after(1800, self._auto_start_go_if_not_connected)
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -233,11 +235,12 @@ class ConnectP2pDesktopApp:
                 "连接模式提示 (推荐电脑开热点防断网)",
                 f"直接让电脑作为客户端连接手机热点「{peer.p2p_ssid}」会临时切换电脑的主 Wi-Fi 网卡（导致电脑外网暂时断开）。\n\n"
                 f"💡 强烈推荐【电脑不断网方案】：\n"
-                f"点击『否』，然后点电脑上方的『⚡ 开启本机热点』，在手机上扫描连接电脑——这样电脑和手机都不会断网！\n\n"
-                f"是否仍要切换电脑 Wi-Fi 连接该手机热点？",
+                f"点击『否』，程序将自动为您开启电脑虚拟直连热点 (192.168.137.1)，手机端会自动发现并免密连接，电脑主 Wi-Fi 保持不断网！\n\n"
+                f"是否仍要切换电脑主 Wi-Fi 连接该手机热点？（选『否』将自动开启电脑不断网热点）",
                 parent=self.root,
             )
             if not ok_switch:
+                self._on_start_go()
                 return
 
         threading.Thread(
@@ -245,6 +248,10 @@ class ConnectP2pDesktopApp:
             args=(peer,),
             daemon=True,
         ).start()
+
+    def _auto_start_go_if_not_connected(self) -> None:
+        if self.node.connected_peer is None and not self.node.p2p_controller.is_active:
+            self._on_start_go()
 
     def _on_start_go(self) -> None:
         def task() -> None:

@@ -144,9 +144,15 @@ class P2pTransferService : Service() {
                 bleChannel.onScreenInteractiveChanged(interactive)
             },
             onIdleTeardown = {
-                emitLog("[空闲自动降功耗] 传输空闲超时 -> 自动拆除 Wi-Fi P2P 热点并释放唤醒锁")
-                sendP2pTeardownSignal()
-                wifiP2pManager.teardownGroup()
+                val hasActiveP2pPeer = discoveredPeers.values.any {
+                    it.isConnected && (it.ip?.startsWith("192.168.137.") == true || it.ip?.startsWith("192.168.49.") == true)
+                }
+                if (hasActiveP2pPeer) {
+                    emitLog("[空闲自动降功耗] 文件传输已完成，已释放全部唤醒锁并回归 DEEP_IDLE 超低功耗监听态")
+                } else {
+                    emitLog("[空闲自动降功耗] 热点无活动连接，已自动拆除 Wi-Fi P2P 热点并释放唤醒锁")
+                    wifiP2pManager.teardownGroup()
+                }
             }
         )
 
@@ -169,6 +175,16 @@ class P2pTransferService : Service() {
                         emitLog("[正在请求授权] Wi-Fi直连已接通，正在请求 ${pending.deviceName} ($goIp) 同意连接...")
                         sendPairRequestFrame(goIp, null, P2pProtocol.DATA_TCP_PORT)
                     } else {
+                        if (pending != null) {
+                            pending.isConnected = true
+                            pending.lastSeenMs = System.currentTimeMillis()
+                            connectedPeer = pending
+                            updateConnectionNotification()
+                            serviceScope.launch {
+                                uiCallback?.onConnectedPeerChanged(connectedPeer)
+                                uiCallback?.onPeersUpdated(getPeerList())
+                            }
+                        }
                         sendPairRequestFrame(goIp, pending?.deviceId, P2pProtocol.DATA_TCP_PORT)
                         android.os.Handler(mainLooper).postDelayed({
                             clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
@@ -196,6 +212,11 @@ class P2pTransferService : Service() {
                     }
                     // Primary category 1 = Computer (Windows PC)!
                     val isWinPc = pType.startsWith("1-") || rawName.contains("WIN", ignoreCase = true) || rawName.contains("PC", ignoreCase = true)
+                    // Ignore passive Windows PC system P2P MAC entries that are not ConnectP2P hotspots (`DIRECT-CP-*`),
+                    // because Windows ConnectP2P hotspots are discovered via `DIRECT-CP-*` scan or `HELLO` on 192.168.137.1.
+                    if (isWinPc && !rawName.startsWith("DIRECT-CP-")) {
+                        continue
+                    }
                     val (friendlyName, isAuto) = P2pProtocol.decodeP2pSsid(rawName)
                     val peer = P2pProtocol.PeerInfo(
                         deviceId = "p2pdev-$addr",
@@ -220,6 +241,9 @@ class P2pTransferService : Service() {
             onDirectHotspotsScanned = { hotspots ->
                 for (hp in hotspots) {
                     upsertPeer(hp)
+                    if (isTrustedPeer(hp) && !hp.p2pSsid.isNullOrEmpty() && !hp.p2pPassphrase.isNullOrEmpty()) {
+                        wifiP2pManager.registerWifiSuggestionForHotspot(hp.p2pSsid!!, hp.p2pPassphrase!!)
+                    }
                     if (!isManuallyDisconnected && !isPeerManuallyDisconnected(hp) &&
                         isTrustedPeer(hp) && wifiP2pManager.canAutoAttemptConnect(hp.p2pSsid)
                     ) {
@@ -307,6 +331,14 @@ class P2pTransferService : Service() {
     }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            super.onAvailable(network)
+            serviceScope.launch {
+                delay(400L)
+                announcePresenceHello()
+            }
+        }
+
         override fun onLost(network: Network) {
             super.onLost(network)
             serviceScope.launch {
@@ -565,14 +597,15 @@ class P2pTransferService : Service() {
                 val pass = peer.p2pPassphrase ?: P2pProtocol.deriveP2pPassphrase(ssid)
                 val goIp = peer.p2pGoIp ?: peer.ip ?: P2pProtocol.WINDOWS_GO_DEFAULT_IP
                 emitLog("[一键免密直连] 正在连接 ${peer.deviceName} ($ssid)...")
-                connectToPeerBurstGroup(ssid, pass, goIp, isManualUserClick = isManualUserClick)
-                if (isTrustedPeer(peer)) {
+                if (isTrustedPeer(peer) && wifiP2pManager.isSubnetAlreadyReachable(goIp)) {
                     peer.isConnected = true
+                    peer.lastSeenMs = System.currentTimeMillis()
                     connectedPeer = peer
                     updateConnectionNotification()
                     uiCallback?.onConnectedPeerChanged(peer)
                     uiCallback?.onPeersUpdated(getPeerList())
                 }
+                connectToPeerBurstGroup(ssid, pass, goIp, isManualUserClick = isManualUserClick)
             }
             peer.discoverySource == "p2p_peer" && !peer.p2pDeviceAddress.isNullOrEmpty() -> {
                 pendingP2pPeer = peer
@@ -793,8 +826,15 @@ class P2pTransferService : Service() {
         bleChannel.broadcastFrameToDiscoveredBlePeers(frame, isClipboard = false)
         if (!targetIp.isNullOrBlank()) {
             transportEngine.sendControlFrameUdp(frame, targetIp)
+            transportEngine.sendControlFrameTcp(frame, targetIp, P2pProtocol.DATA_TCP_PORT)
         } else {
             transportEngine.broadcastControlFrameUdp(frame, extraTargetIp = targetPeerIp)
+            if (wifiP2pManager.isSubnetAlreadyReachable(P2pProtocol.WINDOWS_GO_DEFAULT_IP)) {
+                transportEngine.sendControlFrameTcp(frame, P2pProtocol.WINDOWS_GO_DEFAULT_IP, P2pProtocol.DATA_TCP_PORT)
+            }
+            if (wifiP2pManager.isSubnetAlreadyReachable(P2pProtocol.ANDROID_GO_DEFAULT_IP)) {
+                transportEngine.sendControlFrameTcp(frame, P2pProtocol.ANDROID_GO_DEFAULT_IP, P2pProtocol.DATA_TCP_PORT)
+            }
         }
     }
 

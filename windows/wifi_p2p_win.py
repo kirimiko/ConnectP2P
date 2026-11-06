@@ -98,21 +98,76 @@ class WindowsWifiP2pController:
         target_pass = passphrase or derive_p2p_passphrase(target_ssid)
 
         ps_script = f"""
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
+$tetheringStarted = $false
+$tm = $null
+$publisher = $null
+$listener = $null
 try {{
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
+    [void][Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+    [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+    [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
     [void][Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher, Windows.Devices.WiFiDirect, ContentType=WindowsRuntime]
+    [void][Windows.Devices.WiFiDirect.WiFiDirectConnectionListener, Windows.Devices.WiFiDirect, ContentType=WindowsRuntime]
     [void][Windows.Security.Credentials.PasswordCredential, Windows.Security.Credentials, ContentType=WindowsRuntime]
 
-    $publisher = New-Object Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher
-    $publisher.Advertisement.IsAutonomousGroupOwnerEnabled = $true
-    $publisher.Advertisement.ListenStateDiscoverability = [Windows.Devices.WiFiDirect.WiFiDirectAdvertisementListenStateDiscoverability]::Normal
-    $publisher.Advertisement.LegacySettings.IsEnabled = $true
-    $publisher.Advertisement.LegacySettings.Ssid = '{target_ssid}'
-    $cred = New-Object Windows.Security.Credentials.PasswordCredential
-    $cred.Password = '{target_pass}'
-    $publisher.Advertisement.LegacySettings.Passphrase = $cred
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]
+    Function Await($WinRtTask, $ResultType) {{
+        $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+        $netTask = $asTask.Invoke($null, @($WinRtTask))
+        $netTask.Wait(8000) | Out-Null
+        return $netTask.Result
+    }}
+    $asTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' }})[0]
+    Function AwaitAction($WinRtAction) {{
+        $netTask = $asTaskAction.Invoke($null, @($WinRtAction))
+        $netTask.Wait(8000) | Out-Null
+    }}
 
-    $publisher.Start()
+    # 1. Start Windows Mobile Hotspot (NetworkOperatorTetheringManager) on virtual adapter (192.168.137.1)
+    #    This broadcasts standard 802.11 WPA2 beacons visible to all Android phones WITHOUT disconnecting
+    #    or switching the laptop's primary Wi-Fi connection!
+    try {{
+        $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+        if ($null -eq $profile) {{
+            $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles() | Select-Object -First 1
+        }}
+        if ($null -ne $profile) {{
+            $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+            if ($null -ne $tm) {{
+                $cfg = New-Object Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration
+                $cfg.Ssid = '{target_ssid}'
+                $cfg.Passphrase = '{target_pass}'
+                AwaitAction ($tm.ConfigureAccessPointAsync($cfg))
+                if ($tm.TetheringOperationalState -ne 'On') {{
+                    $res = Await ($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+                    if ($res.Status -eq 'Success') {{
+                        $tetheringStarted = $true
+                    }}
+                }} else {{
+                    $tetheringStarted = $true
+                }}
+            }}
+        }}
+    }} catch {{
+    }}
+
+    # 2. Also start WiFiDirectAdvertisementPublisher + ConnectionListener for P2P discovery
+    try {{
+        $listener = New-Object Windows.Devices.WiFiDirect.WiFiDirectConnectionListener
+        $publisher = New-Object Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher
+        $publisher.Advertisement.IsAutonomousGroupOwnerEnabled = $true
+        $publisher.Advertisement.ListenStateDiscoverability = [Windows.Devices.WiFiDirect.WiFiDirectAdvertisementListenStateDiscoverability]::Intensive
+        $publisher.Advertisement.LegacySettings.IsEnabled = $true
+        $publisher.Advertisement.LegacySettings.Ssid = '{target_ssid}'
+        $cred = New-Object Windows.Security.Credentials.PasswordCredential
+        $cred.Password = '{target_pass}'
+        $publisher.Advertisement.LegacySettings.Passphrase = $cred
+        $publisher.Start()
+    }} catch {{
+    }}
+
     Write-Output "READY:{target_ssid}:{target_pass}"
     [Console]::Out.Flush()
 
@@ -122,7 +177,13 @@ try {{
             break
         }}
     }}
-    $publisher.Stop()
+
+    if ($null -ne $publisher) {{
+        try {{ $publisher.Stop() }} catch {{}}
+    }}
+    if ($tetheringStarted -and $null -ne $tm) {{
+        try {{ Await ($tm.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]) | Out-Null }} catch {{}}
+    }}
 }} catch {{
     Write-Output "ERROR:$($_.Exception.Message)"
     [Console]::Out.Flush()
@@ -151,7 +212,13 @@ try {{
                 line = proc.stdout.readline().strip()
 
             if line.startswith("READY:"):
-                go_ip = self._detect_local_p2p_ip() or WINDOWS_GO_DEFAULT_IP
+                go_ip = None
+                for _ in range(10):
+                    go_ip = self._detect_local_p2p_ip()
+                    if go_ip:
+                        break
+                    time.sleep(0.25)
+                go_ip = go_ip or WINDOWS_GO_DEFAULT_IP
                 creds = P2pGroupCredentials(
                     ssid=target_ssid,
                     passphrase=target_pass,

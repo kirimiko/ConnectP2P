@@ -35,6 +35,7 @@ from protocol import (
     PeerInfo,
     PowerState,
     derive_p2p_passphrase,
+    encode_frame,
 )
 from transport import IdlePowerWatchdog, P2pDataTransportEngine, TransferProgress
 from wifi_p2p_win import P2pGroupCredentials, WindowsWifiP2pController
@@ -284,6 +285,26 @@ class ConnectP2pWindowsNode:
         """
         self._emit_log("[正在扫描周围设备] 正在探测局域网在线设备与附近 Wi-Fi Direct 热点...")
         self.control.announce_presence_once()
+        for arp_ip in self.control._get_arp_hotspot_peers():
+            try:
+                hello_frame = encode_frame(
+                    FrameType.HELLO,
+                    {
+                        "device_id": self.device_id,
+                        "device_name": self.device_name,
+                        "platform": "windows",
+                        "data_port": self.transport.bound_port,
+                        "timestamp": int(time.time() * 1000),
+                    },
+                )
+                self.transport.send_control_frame_over_tcp(
+                    arp_ip,
+                    hello_frame,
+                    target_port=DATA_TCP_PORT,
+                    timeout=0.8,
+                )
+            except Exception:
+                pass
         p2p_peers = self.p2p_controller.scan_nearby_p2p_networks()
         for p in p2p_peers:
             self.control.upsert_discovered_peer(p)
@@ -487,6 +508,7 @@ class ConnectP2pWindowsNode:
         Explicitly or automatically spin up Windows Wi-Fi Direct Autonomous GO (`DIRECT-CP-...`).
         Uses deterministic SSID/Passphrase so Android phones can scan and 1-tap connect without typing!
         """
+        self._manually_disconnected = False
         self.watchdog.set_state(PowerState.P2P_HANDSHAKE)
         creds = self.p2p_controller.start_autonomous_group_owner(port=self.transport.bound_port)
         self.watchdog.set_state(PowerState.P2P_BURST_ACTIVE)
@@ -498,10 +520,49 @@ class ConnectP2pWindowsNode:
             go_ip=creds.go_ip,
             port=creds.port,
         )
+        threading.Thread(
+            target=self._probe_hotspot_arp_clients_loop,
+            daemon=True,
+        ).start()
         self._emit_log(
             f"[本机直连热点已开启] 手机点击『扫描周围设备』即可看到 \"{self.device_name}\" 一键免密连接 (SSID={creds.ssid})"
         )
         return creds
+
+    def _probe_hotspot_arp_clients_loop(self) -> None:
+        """
+        When Windows Mobile Hotspot (192.168.137.1) is started, watch ARP for newly associated
+        Android clients (192.168.137.x) and immediately announce presence over UDP & TCP so
+        cross-network discovery succeeds in < 1 second even if UDP broadcast is filtered.
+        """
+        seen_arp_ips: set[str] = set()
+        for _ in range(40):
+            if not self._running or not self.p2p_controller.is_active:
+                break
+            try:
+                for arp_ip in self.control._get_arp_hotspot_peers():
+                    if arp_ip not in seen_arp_ips:
+                        seen_arp_ips.add(arp_ip)
+                        self.control.announce_presence_once(target_ip=arp_ip)
+                        hello_frame = encode_frame(
+                            FrameType.HELLO,
+                            {
+                                "device_id": self.device_id,
+                                "device_name": self.device_name,
+                                "platform": "windows",
+                                "data_port": self.transport.bound_port,
+                                "timestamp": int(time.time() * 1000),
+                            },
+                        )
+                        self.transport.send_control_frame_over_tcp(
+                            arp_ip,
+                            hello_frame,
+                            target_port=DATA_TCP_PORT,
+                            timeout=1.0,
+                        )
+            except Exception:
+                pass
+            time.sleep(1.5)
 
     def connect_to_android_p2p_group(
         self,
@@ -802,7 +863,27 @@ class ConnectP2pWindowsNode:
         )
         self.control.upsert_discovered_peer(peer)
         stored_peer = self.control.peers.get(remote_id) or peer
-        if ftype == FrameType.PAIR_REQUEST:
+        if ftype == FrameType.HELLO:
+            if not header.get("is_reply"):
+                reply_frame = encode_frame(
+                    FrameType.HELLO,
+                    {
+                        "device_id": self.device_id,
+                        "device_name": self.device_name,
+                        "platform": "windows",
+                        "data_port": self.transport.bound_port,
+                        "is_reply": True,
+                        "timestamp": int(time.time() * 1000),
+                    },
+                )
+                self.control.announce_presence_once(target_ip=sender_ip)
+                self.transport.send_control_frame_over_tcp(
+                    sender_ip,
+                    reply_frame,
+                    target_port=remote_port,
+                    timeout=1.0,
+                )
+        elif ftype == FrameType.PAIR_REQUEST:
             self._handle_pair_request(stored_peer, header)
         elif ftype == FrameType.PAIR_RESPONSE:
             self._handle_pair_response(stored_peer, bool(header.get("accepted", False)))
@@ -876,9 +957,15 @@ class ConnectP2pWindowsNode:
 
     def _handle_idle_teardown(self) -> None:
         if self.p2p_controller.is_active:
-            self.control.send_p2p_teardown()
+            has_active_p2p_peer = any(
+                p.is_connected and p.ip and (p.ip.startswith("192.168.137.") or p.ip.startswith("192.168.49."))
+                for p in self.control.peers.values()
+            )
+            if has_active_p2p_peer:
+                self._emit_log("[空闲自动降功耗] 文件传输已完成，已回归 DEEP_IDLE 超低功耗监听态 (保持直连通道在线)")
+                return
             self.p2p_controller.teardown()
-            self._emit_log("[空闲自动降功耗] 文件传输已静默满超时，已自动关闭 Wi-Fi Direct 热点/连接")
+            self._emit_log("[空闲自动降功耗] 热点无活动连接设备，已自动关闭 Wi-Fi 热点回到超低功耗待机")
 
     def _emit_log(self, msg: str) -> None:
         logger.info(msg)
