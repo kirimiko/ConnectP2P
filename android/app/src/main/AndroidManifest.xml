@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Wi-Fi Direct (Wi-Fi P2P) Permissions -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Android 13+ (API 33+) Wi-Fi P2P + Location for Wi-Fi Direct / SSID Scan on OEM ROMs -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="tiramisu" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- BLE Low-Power Control Channel Permissions -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Strictly Scoped WakeLock & Foreground Service ONLY during active file transfer -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+
+    <uses-feature android:name="android.hardware.wifi.direct" android:required="true" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:label="ConnectP2P"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- System Share Sheet ("Share to ConnectP2P") for zero-background-battery file & text sending -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- Translucent Activity for 1-tap background Clipboard read from Quick Settings / Notification -->
+        <activity
+            android:name=".clipboard.ClipboardSyncActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Ephemeral Foreground Service: starts ONLY when transfer begins, stops when idle -->
+        <service
+            android:name=".service.P2pTransferService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Quick Settings Tile for 1-tap Clipboard Sync on Android 10+ without battery-draining Accessibility -->
+        <service
+            android:name=".clipboard.ClipboardTileService"
+            android:exported="true"
+            android:icon="@android:drawable/ic_menu_share"
+            android:label="同步剪贴板 (P2P)"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>

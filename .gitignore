@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Android / Gradle build outputs, APKs & local SDK paths
+*.apk
+*.aab
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.iml
+.idea/
+.gradle/
+
+# Local test screenshots & temporary files
+*.png
+*.jpg
+*.part
+*.log
+.DS_Store
+Thumbs.db

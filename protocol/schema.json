@@ -1,0 +1,47 @@
+{
+  "protocol_version": "1.1.0",
+  "magic_bytes_hex": "5032",
+  "magic_ascii": "P2",
+  "encrypted_header_magic_ascii": "E1",
+  "encryption": {
+    "header_and_inline_payload": "AES-256-GCM (96-bit nonce, 128-bit tag)",
+    "file_stream": "AES-256-CTR (128-bit random IV per transfer) + SHA-256"
+  },
+  "ports": {
+    "control_udp": 45820,
+    "data_tcp": 45821
+  },
+  "multicast_group": "239.255.77.88",
+  "p2p_default_ips": {
+    "android_go": "192.168.49.1",
+    "windows_go": "192.168.137.1"
+  },
+  "ble": {
+    "service_uuid": "0000c0de-0000-1000-8000-00805f9b34fb",
+    "control_char_uuid": "0000c0df-0000-1000-8000-00805f9b34fb",
+    "clipboard_char_uuid": "0000c0e0-0000-1000-8000-00805f9b34fb",
+    "max_inline_clipboard_bytes": 16384,
+    "mtu_chunk_size": 480
+  },
+  "power_policy": {
+    "p2p_idle_teardown_seconds": 15,
+    "wakelock_max_timeout_seconds": 600,
+    "transfer_socket_buffer_bytes": 262144,
+    "file_chunk_size_bytes": 262144,
+    "pause_discovery_on_screen_off": true
+  },
+  "frame_types": {
+    "HELLO": 1,
+    "CLIPBOARD_SYNC": 2,
+    "FILE_OFFER": 3,
+    "FILE_ACCEPT": 4,
+    "FILE_DATA": 5,
+    "FILE_ACK": 6,
+    "P2P_WAKE_REQUEST": 7,
+    "P2P_GROUP_READY": 8,
+    "P2P_TEARDOWN": 9,
+    "PING_PONG": 10,
+    "PAIR_REQUEST": 11,
+    "PAIR_RESPONSE": 12
+  }
+}

@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <!-- Device Nickname Row -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="本机名称:"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/etDeviceName"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1"
+            android:hint="给设备起个名字 (如: MyPhone)"
+            android:inputType="text"
+            android:singleLine="true"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/btnSaveName"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="💾 保存"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- Power State & Connected Peer Banner -->
+    <TextView
+        android:id="@+id/tvPowerState"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="● 功耗状态: DEEP_IDLE (超低功耗待机 | Wi-Fi P2P关闭 | 无唤醒锁)"
+        android:textColor="#1B7F37"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvConnectedPeer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="当前连接: 暂未选择设备 (请点击下方『扫描周围设备』后点击列表连接)"
+        android:textColor="#005FB8"
+        android:textSize="12sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvGroupCredentials"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="本机直连热点: 未开启 (点击开启后，电脑/其他手机扫描即可一键免密连接)"
+        android:textSize="11sp" />
+
+    <!-- Primary Discovery & Hotspot Controls -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnScanPeers"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.1"
+            android:text="🔍 扫描周围设备"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnStartGo"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1.1"
+            android:text="⚡ 开启本机热点"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnTeardownP2p"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:layout_weight="0.95"
+            android:text="🔌 断开连接"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- Discovered Nearby Devices List (Tap to 1-Click Connect & Sync Clipboard) -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="周围可用设备 (点击列表中的设备即可一键连接并同步剪贴板):"
+        android:textSize="12sp"
+        android:textStyle="bold" />
+
+    <ListView
+        android:id="@+id/lvPeers"
+        android:layout_width="match_parent"
+        android:layout_height="115dp"
+        android:layout_marginTop="4dp"
+        android:background="#252526"
+        android:divider="#3E3E42"
+        android:dividerHeight="1dp" />
+
+    <!-- File & Clipboard Actions -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnPickFiles"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="📁 选择文件高速发送"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnPushClipboard"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:text="📋 立即同步剪贴板"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- Compact Fallback Manual Connect -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:orientation="horizontal">
+
+        <EditText
+            android:id="@+id/etPeerSsid"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="手动SSID(可选)"
+            android:inputType="text"
+            android:singleLine="true"
+            android:textSize="11sp" />
+
+        <EditText
+            android:id="@+id/etPeerPassphrase"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:layout_weight="0.8"
+            android:hint="密码(可选)"
+            android:inputType="textPassword"
+            android:singleLine="true"
+            android:textSize="11sp" />
+
+        <EditText
+            android:id="@+id/etTargetIp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:layout_weight="1"
+            android:hint="目标IP"
+            android:inputType="textUri"
+            android:singleLine="true"
+            android:text="192.168.49.1"
+            android:textSize="11sp" />
+
+        <Button
+            android:id="@+id/btnConnectPeerGo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="手动连接"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <ProgressBar
+        android:id="@+id/progressBar"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:max="100" />
+
+    <TextView
+        android:id="@+id/tvProgress"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="🔒 AES-256 端到端加密已启用 | 接收目录: 内部存储/Download/ConnectP2P"
+        android:textSize="11sp" />
+
+    <!-- Event & Power Log Console -->
+    <ScrollView
+        android:id="@+id/scrollLogs"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="6dp"
+        android:layout_weight="1"
+        android:background="#1E1E1E"
+        android:padding="8dp">
+
+        <TextView
+            android:id="@+id/tvLogs"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="#D4D4D4"
+            android:textSize="11sp" />
+    </ScrollView>
+
+</LinearLayout>
