@@ -139,8 +139,8 @@ try {{
                 $cfg = New-Object Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration
                 $cfg.Ssid = '{target_ssid}'
                 $cfg.Passphrase = '{target_pass}'
-                AwaitAction ($tm.ConfigureAccessPointAsync($cfg))
                 if ($tm.TetheringOperationalState -ne 'On') {{
+                    try {{ AwaitAction ($tm.ConfigureAccessPointAsync($cfg)) }} catch {{}}
                     $res = Await ($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
                     if ($res.Status -eq 'Success') {{
                         $tetheringStarted = $true
