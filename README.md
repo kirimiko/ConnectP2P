@@ -91,7 +91,7 @@ python windows/main.py --send-files D:\data\archive.zip --target 192.168.49.1
 ```
 
 ### 2. 安装与使用 Android 端
-1. 直接安装根目录下的 `ConnectP2P-v1.0.0-release.apk`，或在 `android/` 目录执行 `./gradlew assembleRelease` 编译安装。
+1. 从 [GitHub Releases](https://github.com/kirimiko/ConnectP2P/releases/latest) 下载最新 APK 安装，或在 `android/` 目录执行 `./gradlew assembleRelease` 编译安装。
 2. **连接设备**：
    - 在顶部设置本机名称并点击 **“💾 保存”**。
    - **同局域网/热点下**：点击 **“🔍 扫描周围设备”**，在列表中点击目标设备发起连接（首次连接陌生设备需对方点击“同意并信任”）。
