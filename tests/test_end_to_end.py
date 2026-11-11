@@ -280,7 +280,7 @@ class ConnectP2pEndToEndTest(unittest.TestCase):
             self.assertEqual(len(c_received), 0)
 
             # Verify individual peer disconnect keeps other connected peers intact
-            node = ConnectP2pWindowsNode(device_name="TestWin", udp_port=45897, tcp_port=0)
+            node = ConnectP2pWindowsNode(device_name="TestWin", udp_port=45897, tcp_port=0, enable_ble=False)
             p1 = PeerInfo(device_id="and-1", device_name="Phone1", platform="android", ip="127.0.0.1", is_connected=True)
             p2 = PeerInfo(device_id="and-2", device_name="Phone2", platform="android", ip="127.0.0.2", is_connected=True)
             node.control._peers["and-1"] = p1
@@ -338,6 +338,7 @@ class ConnectP2pEndToEndTest(unittest.TestCase):
             device_name="ConsentWinPC",
             udp_port=45898,
             tcp_port=0,
+            enable_ble=False,
             on_pair_request_prompt=lambda p: (prompted_peers.append(p), prompt_evt.set()),
         )
         node.trusted_peers.clear()
@@ -393,7 +394,7 @@ class ConnectP2pEndToEndTest(unittest.TestCase):
                 listen_port=0,
             )
             peer_port = peer_engine.start_server()
-            node = ConnectP2pWindowsNode(device_name="MonitorPC", udp_port=45899, tcp_port=0)
+            node = ConnectP2pWindowsNode(device_name="MonitorPC", udp_port=45899, tcp_port=0, enable_ble=False)
             node.start()
             try:
                 peer = PeerInfo(

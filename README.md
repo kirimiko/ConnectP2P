@@ -48,6 +48,7 @@ ConnectP2P/
 │   ├── wifi_p2p_win.py         # WinRT WiFiDirectAdvertisementPublisher (Autonomous GO) & 热点扫描直连
 │   ├── clipboard_win32.py      # Win32 WM_CLIPBOARDUPDATE 零轮询监听 + SHA-256 防回环写入
 │   ├── control_channel.py      # 低功耗事件控制与微剪贴板通道 (UDP + BLE 分片重组)
+│   ├── ble_link.py             # BLE 中心端：扫描/连接手机 GATT 服务、按 MTU 分片收发、心跳自愈
 │   ├── transport.py            # 高速加密 TCP 文件传输引擎 (AES-256-CTR、断点续传、SHA-256)
 │   └── protocol.py             # 协议编解码、AES-256-GCM/CTR 加解密、SSID 昵称编解码
 ├── android/                    # Android 客户端工程 (Kotlin, MinSDK 26 / TargetSDK 36)
@@ -58,11 +59,13 @@ ConnectP2P/
 │       │   ├── power/PowerPolicyManager.kt         # 锁生命周期管理、灭屏感知、15s 空闲断链
 │       │   ├── ble/BleLowPowerChannel.kt           # 硬件过滤 BLE 低功耗广播/扫描/GATT 微通道
 │       │   ├── p2p/WifiP2pBurstManager.kt          # 5GHz Autonomous GO 与免输密码直连
+│       │   ├── p2p/HotspotLinkManager.kt           # 按需接入电脑热点 (WifiNetworkSpecifier) 与套接字网络绑定
 │       │   ├── p2p/P2pTransportEngine.kt           # 断点续传加密 TCP 引擎与事件套接字
 │       │   ├── clipboard/ClipboardSyncHelper.kt    # 防回环剪贴板同步器
 │       │   ├── clipboard/ClipboardSyncActivity.kt  # 后台状态栏/磁贴瞬时焦点读取窗口
 │       │   ├── clipboard/ClipboardTileService.kt   # 下拉通知栏快捷磁贴
 │       │   ├── service/P2pTransferService.kt       # 协调服务、设备信任管理与通知栏交互
+│       │   ├── service/AutoStartReceiver.kt        # 开机 / App 更新后自动启动服务
 │       │   └── ui/MainActivity.kt                  # 主界面 + 系统“分享到 ConnectP2P”接收器
 │       └── res/layout/activity_main.xml
 └── tests/
@@ -74,9 +77,9 @@ ConnectP2P/
 ## 三、 快速开始
 
 ### 1. 运行 Windows 端 (GUI 或 CLI)
-安装依赖（`pycryptodome` 用于 AES-256-GCM/CTR 硬件加速加密）：
+安装依赖（`pycryptodome` 用于 AES-256-GCM/CTR 加密，`bleak` 用于和手机之间的低功耗蓝牙连接）：
 ```powershell
-pip install pycryptodome
+pip install pycryptodome bleak
 ```
 启动桌面端或命令行：
 ```powershell
@@ -92,9 +95,13 @@ python windows/main.py --send-files D:\data\archive.zip --target 192.168.49.1
 2. **连接设备**：
    - 在顶部设置本机名称并点击 **“💾 保存”**。
    - **同局域网/热点下**：点击 **“🔍 扫描周围设备”**，在列表中点击目标设备发起连接（首次连接陌生设备需对方点击“同意并信任”）。
-   - **手机和电脑不在同一网络**：电脑端启动后会自动开启 Windows 移动热点 `DIRECT-CP-N-<电脑名>`（运行虚拟网卡上，电脑主 Wi-Fi 不断开；程序运行期间保持开启，退出时关闭）。手机端在设备列表点该电脑的 **“🔗 连接”**：
-     - 第一次会弹出系统确认框“要与 ConnectP2P 搭配使用的设备”，点 **“连接”**；之后系统记住授权，打开 App 即自动连上。
-     - 手机若不支持“双 Wi-Fi 并发”（App 日志会提示），连接电脑热点期间手机会暂时离开当前 Wi-Fi，上网走移动数据；断开或电脑端退出后自动回到原 Wi-Fi。
+   - **手机和电脑不在同一网络（默认走低功耗蓝牙）**：两端都打开蓝牙即可。电脑端会自动搜索并通过 BLE 连接手机（约 10 秒），设备发现、在线状态、配对和剪贴板文字都走蓝牙，手机一直留在自己的 Wi-Fi 上。
+     - **传文件 / 大段剪贴板时**：电脑临时开启 Windows 移动热点 `DIRECT-CP-N-<电脑名>`（虚拟网卡，电脑主 Wi-Fi 不断开），通过蓝牙通知手机自动接入，传完空闲约 15 秒后双方自动退出热点。
+     - 第一次接入电脑热点时，手机会弹出系统确认框“要与 ConnectP2P 搭配使用的设备”，点 **“连接”**；之后系统记住授权，后台也能自动接入。
+     - 手机若不支持“双 Wi-Fi 并发”（App 日志会提示），接入电脑热点的那几秒手机会暂时离开当前 Wi-Fi、上网走移动数据，传完自动回到原 Wi-Fi。
+     - 手机没开蓝牙时：在电脑端勾选 **“热点常开”**，手机会像以前一样通过电脑热点保持连接（更耗电）。
+   - **手机后台运行**：App 以常驻通知的前台服务运行，熄屏、Doze 下都能接收电脑的剪贴板和文件。从手机发剪贴板到电脑：复制后点通知栏 ConnectP2P 的 **“📋 发送剪贴板”**（Android 不允许后台 App 自动读取剪贴板）。
+     - **荣耀 / 华为手机需手动放开后台限制**，否则手机重启、App 更新或被系统清理后不会自动恢复：`设置 → 应用和服务 → 应用启动管理 → ConnectP2P`，关闭“自动管理”，打开 **允许自启动、允许关联启动、允许后台活动**。
    - **两台手机互连**：在任意一端点击 **“⚡ 开启本机热点”**，另一端点击 **“🔍 扫描周围设备”** 即可看到对方设备名称并一键免密连接。
 3. **文件接收保存路径**：
    - **Windows 端**：默认保存在 `C:\Users\<用户名>\Downloads\ConnectP2P\`

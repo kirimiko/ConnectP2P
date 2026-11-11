@@ -156,6 +156,8 @@ object P2pProtocol {
         var p2pPassphrase: String? = null,
         var p2pGoIp: String? = null,
         var p2pDeviceAddress: String? = null,
+        /** Address of the BLE link to this peer (the PC connects to us as a GATT central). */
+        var bleAddress: String? = null,
         var discoverySource: String = "lan", // "lan" | "p2p_scan" | "p2p_peer" | "ble"
         var isConnected: Boolean = false,
         var lastSeenMs: Long = System.currentTimeMillis()

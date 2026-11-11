@@ -174,13 +174,24 @@ class P2pTransferService : Service() {
                 bleChannel.onScreenInteractiveChanged(interactive)
             },
             onIdleTeardown = {
+                // When every peer on the PC hotspot is also reachable over BLE, Wi-Fi was only needed for the
+                // transfer: leave the hotspot so the phone returns to its own Wi-Fi.
+                val hotspotPeers = discoveredPeers.values.filter { p -> p.isConnected && p.ip?.let { hotspotLink.networkFor(it) } != null }
+                if (hotspotLink.isUp && hotspotPeers.all { isBleLinked(it) }) {
+                    emitLog("[空闲自动降功耗] 传输已结束，已退出电脑热点，剪贴板继续走低功耗蓝牙")
+                    hotspotLink.disconnect()
+                    transportEngine.releaseNetworkSockets()
+                    hotspotPeers.forEach { it.ip = null }
+                }
                 val hasActiveP2pPeer = discoveredPeers.values.any {
                     it.isConnected && (it.ip?.startsWith("192.168.137.") == true || it.ip?.startsWith("192.168.49.") == true)
                 }
                 if (hasActiveP2pPeer) {
                     emitLog("[空闲自动降功耗] 文件传输已完成，已释放全部唤醒锁并回归 DEEP_IDLE 超低功耗监听态")
                 } else {
-                    emitLog("[空闲自动降功耗] 热点无活动连接，已自动拆除 Wi-Fi P2P 热点并释放唤醒锁")
+                    if (wifiP2pManager.activeGroupSsid != null) {
+                        emitLog("[空闲自动降功耗] 本机热点无活动连接，已自动关闭并释放唤醒锁")
+                    }
                     wifiP2pManager.teardownGroup()
                 }
             }
@@ -270,7 +281,10 @@ class P2pTransferService : Service() {
         bleChannel = BleLowPowerChannel(
             context = this,
             onControlFrameReceived = { frame, senderAddr ->
-                handleControlFrame(frame, senderAddr)
+                serviceScope.launch { handleControlFrame(frame, senderAddr) }
+            },
+            onCentralLinkChanged = { address, up ->
+                serviceScope.launch { handleBleLinkChanged(address, up) }
             }
         )
 
@@ -343,6 +357,7 @@ class P2pTransferService : Service() {
         registerNetworkCallback()
         startConnectedPeersLivenessLoop()
 
+        updateConnectionNotification()
         announcePresenceHello()
         emitLog("[DEEP_IDLE] 服务已就绪 (AES-256 端到端加密已启用 | 接收目录: 内部存储/Download/ConnectP2P)")
     }
@@ -376,6 +391,66 @@ class P2pTransferService : Service() {
         }
     }
 
+    /**
+     * The PC (BLE central) subscribed to / dropped our GATT server. The PC identifies itself with HELLO over
+     * the link; a trusted PC then becomes connected without any Wi-Fi.
+     */
+    private suspend fun handleBleLinkChanged(address: String, up: Boolean) {
+        if (up) {
+            emitLog("[蓝牙已连接] 电脑已通过低功耗蓝牙接入 ($address)")
+            // BLE now covers presence/clipboard: drop a pending fallback request for the PC's hotspot.
+            if (hotspotLink.state == HotspotLinkManager.State.REQUESTING) {
+                hotspotLink.disconnect()
+            }
+            bleChannel.notifyFrame(address, buildHelloFrame(isReply = false))
+            return
+        }
+        val peer = discoveredPeers.values.firstOrNull { it.bleAddress == address } ?: return
+        peer.bleAddress = null
+        if (!peer.isConnected) return
+        val ip = peer.ip
+        val ipAlive = ip != null && transportEngine.probePeerAlive(ip, peer.dataPort, timeoutMs = 1500)
+        if (!ipAlive) {
+            markPeerDisconnected(peer, "[连接状态更新] ${peer.deviceName} 的蓝牙连接已断开")
+        }
+    }
+
+    private fun markPeerDisconnected(peer: P2pProtocol.PeerInfo, logMessage: String) {
+        peer.isConnected = false
+        emitLog(logMessage)
+        if (connectedPeer?.deviceId == peer.deviceId) {
+            connectedPeer = discoveredPeers.values.firstOrNull { it.isConnected && it.deviceId != peer.deviceId }
+            connectedPeer?.ip?.let { targetPeerIp = it }
+        }
+        if (connectedPeer == null) powerPolicy.forceDeepIdleNow()
+        updateConnectionNotification()
+        serviceScope.launch {
+            uiCallback?.onConnectedPeerChanged(connectedPeer)
+            uiCallback?.onPeersUpdated(getPeerList())
+        }
+    }
+
+    private fun isBleLinked(peer: P2pProtocol.PeerInfo?): Boolean = bleChannel.isCentralLinked(peer?.bleAddress)
+
+    /**
+     * Sends a frame over every link the peer is reachable on (BLE and/or IP). Receivers tolerate duplicates:
+     * clipboard is de-duplicated by hash and control frames are idempotent.
+     */
+    private fun sendToPeer(peer: P2pProtocol.PeerInfo, frame: ByteArray, tcp: Boolean = true): Boolean {
+        var sent = false
+        val ble = peer.bleAddress
+        if (ble != null && bleChannel.isCentralLinked(ble) && bleChannel.notifyFrame(ble, frame)) {
+            sent = true
+        }
+        val ip = peer.ip
+        if (ip != null) {
+            transportEngine.sendControlFrameUdp(frame, ip)
+            if (tcp) transportEngine.sendControlFrameTcp(frame, ip, peer.dataPort)
+            sent = true
+        }
+        return sent
+    }
+
     private fun releaseUnresponsiveHotspot() {
         val ssid = hotspotLink.ssid ?: return
         hotspotSuppressedUntil[ssid] = System.currentTimeMillis() + 5 * 60_000L
@@ -388,12 +463,14 @@ class P2pTransferService : Service() {
         transportEngine.releaseNetworkSockets()
         var changed = false
         for (p in discoveredPeers.values) {
-            if (p.isConnected && p.ip?.startsWith("192.168.137.") == true) {
+            if (p.ip?.startsWith("192.168.137.") != true) continue
+            p.ip = null
+            if (p.isConnected && !isBleLinked(p)) {
                 p.isConnected = false
                 changed = true
             }
         }
-        if (connectedPeer?.ip?.startsWith("192.168.137.") == true) {
+        if (connectedPeer != null && connectedPeer?.isConnected != true) {
             connectedPeer = discoveredPeers.values.firstOrNull { it.isConnected }
             connectedPeer?.ip?.let { targetPeerIp = it }
             changed = true
@@ -443,7 +520,10 @@ class P2pTransferService : Service() {
         return true
     }
 
-    /** Only effective while the app is in the foreground: Android ignores specifier requests from background apps. */
+    /**
+     * Fallback when the PC is not reachable over BLE or LAN (e.g. phone Bluetooth off, PC in "hotspot always on"
+     * mode). Only effective while the app is foreground (activity or foreground service).
+     */
     private fun tryAutoConnectTrustedHotspot() {
         if (isManuallyDisconnected || connectedPeer != null) return
         for ((name, cred) in peerHotspots) {
@@ -574,6 +654,12 @@ class P2pTransferService : Service() {
                 livenessMisses[peer.deviceId] = misses
                 if (!forceProbe && misses < 2) continue
                 livenessMisses.remove(peer.deviceId)
+                if (isBleLinked(peer)) {
+                    // Still reachable over BLE; only the Wi-Fi path is gone.
+                    peer.ip = null
+                    statusChanged = true
+                    continue
+                }
                 peer.isConnected = false
                 statusChanged = true
                 emitLog("[连接状态更新] 检测到与 ${peer.deviceName} ($ip) 的连接已断开/离线")
@@ -632,7 +718,8 @@ class P2pTransferService : Service() {
                 teardownBurstGroupNow()
             }
         }
-        return START_NOT_STICKY // Do not needlessly restart in background when idle
+        // Restart after the system kills us, so the PC can keep reaching the phone over BLE.
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -710,10 +797,11 @@ class P2pTransferService : Service() {
             verifyConnectedPeersLiveness(forceProbe = true)
         }
         uiCallback?.onPeersUpdated(getPeerList())
-        // Give LAN discovery a moment; if no trusted peer answered, reach a trusted PC through its hotspot.
+        // Give LAN discovery and the PC's BLE reconnect (it scans every few seconds) time to answer before
+        // falling back to joining a trusted PC's hotspot, which costs the phone its own Wi-Fi.
         serviceScope.launch {
-            delay(2_500L)
-            tryAutoConnectTrustedHotspot()
+            delay(12_000L)
+            if (bleChannel.linkedCentralAddresses().isEmpty()) tryAutoConnectTrustedHotspot()
         }
     }
 
@@ -808,12 +896,17 @@ class P2pTransferService : Service() {
                 }
             }
             else -> {
-                val ip = peer.ip ?: P2pProtocol.ANDROID_GO_DEFAULT_IP
-                targetPeerIp = ip
                 if (!isTrustedPeer(peer)) {
                     requestPairing(peer)
                     return
                 }
+                if (isBleLinked(peer)) {
+                    markPeerConnected(peer, peer.ip)
+                    sendToPeer(peer, buildPairRequestFrame(peer.deviceId))
+                    return
+                }
+                val ip = peer.ip ?: P2pProtocol.ANDROID_GO_DEFAULT_IP
+                targetPeerIp = ip
                 emitLog("[正在连接] ★${peer.deviceName} ($ip)...")
                 serviceScope.launch {
                     if (transportEngine.probePeerAlive(ip, peer.dataPort, timeoutMs = 1500)) {
@@ -838,40 +931,49 @@ class P2pTransferService : Service() {
         }
     }
 
-    private fun markPeerConnected(peer: P2pProtocol.PeerInfo, ip: String) {
+    private fun markPeerConnected(peer: P2pProtocol.PeerInfo, ip: String?) {
         peer.isConnected = true
-        peer.ip = ip
+        if (ip != null) peer.ip = ip
         peer.lastSeenMs = System.currentTimeMillis()
         rememberTrustedPeer(peer)
         connectedPeer = peer
-        targetPeerIp = ip
+        if (ip != null) targetPeerIp = ip
         updateConnectionNotification()
         uiCallback?.onConnectedPeerChanged(peer)
         uiCallback?.onPeersUpdated(getPeerList())
-        emitLog("[已连接] ★${peer.deviceName} ($ip)")
+        emitLog("[已连接] ★${peer.deviceName} (${ip ?: "蓝牙"})")
     }
 
     /**
      * Send `PAIR_REQUEST` to an untrusted stranger device and wait for remote manual approval.
      */
     fun requestPairing(peer: P2pProtocol.PeerInfo) {
+        if (isBleLinked(peer)) {
+            sendToPeer(peer, buildPairRequestFrame(peer.deviceId))
+            emitLog("[等待对方同意连接] 已通过蓝牙向陌生设备 \"${peer.deviceName}\" 发送连接请求，请在对端设备上点击『同意连接』...")
+            return
+        }
         val ip = peer.ip ?: P2pProtocol.ANDROID_GO_DEFAULT_IP
         sendPairRequestFrame(ip, peer.deviceId, peer.dataPort)
         emitLog("[等待对方同意连接] 已向陌生设备 \"${peer.deviceName}\" ($ip) 发送连接请求，请在对端设备上点击『同意连接』...")
     }
 
-    private fun sendPairRequestFrame(destIp: String, targetDeviceId: String?, port: Int = P2pProtocol.DATA_TCP_PORT) {
+    private fun buildPairRequestFrame(targetDeviceId: String?): ByteArray {
         val header = JSONObject().apply {
             put("device_id", deviceId)
             put("device_name", deviceName)
             put("platform", "android")
             put("data_port", P2pProtocol.DATA_TCP_PORT)
-            if (!targetDeviceId.isNullOrBlank() && !targetDeviceId.startsWith("p2p-")) {
+            if (!targetDeviceId.isNullOrBlank() && !targetDeviceId.startsWith("p2p")) {
                 put("target_device_id", targetDeviceId)
             }
             put("timestamp", System.currentTimeMillis())
         }
-        val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.PAIR_REQUEST, header)
+        return P2pProtocol.encodeFrame(P2pProtocol.FrameType.PAIR_REQUEST, header)
+    }
+
+    private fun sendPairRequestFrame(destIp: String, targetDeviceId: String?, port: Int = P2pProtocol.DATA_TCP_PORT) {
+        val frame = buildPairRequestFrame(targetDeviceId)
         bleChannel.broadcastFrameToDiscoveredBlePeers(frame, isClipboard = false)
         transportEngine.sendControlFrameUdp(frame, destIp)
         transportEngine.sendControlFrameTcp(frame, destIp, port)
@@ -901,9 +1003,11 @@ class P2pTransferService : Service() {
             put("timestamp", System.currentTimeMillis())
         }
         val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.PAIR_RESPONSE, header)
-        bleChannel.broadcastFrameToDiscoveredBlePeers(frame, isClipboard = false)
-        transportEngine.sendControlFrameUdp(frame, destIp)
-        transportEngine.sendControlFrameTcp(frame, destIp, peer.dataPort)
+        if (!sendToPeer(peer, frame)) {
+            bleChannel.broadcastFrameToDiscoveredBlePeers(frame, isClipboard = false)
+            transportEngine.sendControlFrameUdp(frame, destIp)
+            transportEngine.sendControlFrameTcp(frame, destIp, peer.dataPort)
+        }
 
         if (accepted) {
             isManuallyDisconnected = false
@@ -1035,7 +1139,7 @@ class P2pTransferService : Service() {
         disconnectCurrentPeer()
     }
 
-    fun announcePresenceHello(targetIp: String? = null, isReply: Boolean = false) {
+    private fun buildHelloFrame(isReply: Boolean): ByteArray {
         val header = JSONObject().apply {
             put("device_id", deviceId)
             put("device_name", deviceName)
@@ -1047,8 +1151,15 @@ class P2pTransferService : Service() {
             wifiP2pManager.currentGoIp?.let { put("go_ip", it) }
             put("timestamp", System.currentTimeMillis())
         }
-        val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.HELLO, header)
+        return P2pProtocol.encodeFrame(P2pProtocol.FrameType.HELLO, header)
+    }
+
+    fun announcePresenceHello(targetIp: String? = null, isReply: Boolean = false) {
+        val frame = buildHelloFrame(isReply)
         bleChannel.broadcastFrameToDiscoveredBlePeers(frame, isClipboard = false)
+        if (targetIp.isNullOrBlank()) {
+            bleChannel.linkedCentralAddresses().forEach { bleChannel.notifyFrame(it, frame) }
+        }
         if (!targetIp.isNullOrBlank()) {
             transportEngine.sendControlFrameUdp(frame, targetIp)
             transportEngine.sendControlFrameTcp(frame, targetIp, P2pProtocol.DATA_TCP_PORT)
@@ -1143,14 +1254,16 @@ class P2pTransferService : Service() {
         val destName = destPeer?.deviceName ?: destIp
         val payload = text.toByteArray(StandardCharsets.UTF_8)
         val digest = clipHash ?: P2pProtocol.computeClipHash(payload)
+        val preview = text.replace("\r", " ").replace("\n", " ").take(36)
 
         // Connect handshakes arrive over both UDP and TCP and each one triggers a sync; send a clip once.
         val now = System.currentTimeMillis()
+        val dedupeKey = destPeer?.deviceId ?: destIp
         val last = lastClipSend
-        if (last != null && last.first == destIp && last.second == digest && now - last.third < 3_000L) {
+        if (last != null && last.first == dedupeKey && last.second == digest && now - last.third < 3_000L) {
             return
         }
-        lastClipSend = Triple(destIp, digest, now)
+        lastClipSend = Triple(dedupeKey, digest, now)
 
         if (payload.size <= P2pProtocol.MAX_INLINE_CLIPBOARD_BYTES) {
             val header = JSONObject().apply {
@@ -1163,20 +1276,52 @@ class P2pTransferService : Service() {
                 realDeviceId(destPeer)?.let { put("target_device_id", it) }
             }
             val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.CLIPBOARD_SYNC, header, payload)
-            // UDP for latency, TCP for delivery; the receiver de-duplicates by clip hash.
-            transportEngine.sendControlFrameUdp(frame, destIp)
-            transportEngine.sendControlFrameTcp(frame, destIp, destPeer?.dataPort ?: P2pProtocol.DATA_TCP_PORT)
-            val preview = text.replace("\r", " ").replace("\n", " ").take(36)
-            emitLog("[已发送剪贴板 → $destName] \"$preview\" (${payload.size} B)")
-        } else {
-            serviceScope.launch {
-                val ok = transportEngine.sendClipboardOverTcp(destIp, text)
-                if (ok) {
-                    val preview = text.replace("\r", " ").replace("\n", " ").take(36)
-                    emitLog("[已发送大剪贴板 → $destName] \"$preview\" (${payload.size} B)")
-                }
+            val bleAddress = destPeer?.bleAddress?.takeIf { bleChannel.isCentralLinked(it) }
+            val fitsBle = bleAddress != null && frame.size <= bleChannel.maxFrameBytesFor(bleAddress)
+            if (destPeer != null && (fitsBle || destPeer.ip != null)) {
+                sendToPeer(destPeer, frame)
+                emitLog("[已发送剪贴板 → $destName] \"$preview\" (${payload.size} B${if (fitsBle) " · 蓝牙" else ""})")
+                return
+            }
+            if (destPeer == null || bleAddress == null) {
+                // UDP for latency, TCP for delivery; the receiver de-duplicates by clip hash.
+                transportEngine.sendControlFrameUdp(frame, destIp)
+                transportEngine.sendControlFrameTcp(frame, destIp, destPeer?.dataPort ?: P2pProtocol.DATA_TCP_PORT)
+                emitLog("[已发送剪贴板 → $destName] \"$preview\" (${payload.size} B)")
+                return
             }
         }
+        // Too large for BLE: needs a Wi-Fi path (LAN, or the PC's hotspot brought up on demand).
+        serviceScope.launch {
+            val ip = if (destPeer != null) ensureWifiPath(destPeer) else destIp
+            if (ip == null) {
+                emitLog("[剪贴板发送失败 → $destName] 内容较大需要 Wi-Fi 通道，但未能建立")
+                return@launch
+            }
+            if (transportEngine.sendClipboardOverTcp(ip, text)) {
+                emitLog("[已发送大剪贴板 → $destName] \"$preview\" (${payload.size} B)")
+            }
+        }
+    }
+
+    /**
+     * Returns an IP the peer answers on for bulk transfer. A BLE-only PC is asked to start its hotspot
+     * (P2P_WAKE_REQUEST); it replies with P2P_GROUP_READY, we join, and its HELLO over the hotspot sets peer.ip.
+     */
+    private suspend fun ensureWifiPath(peer: P2pProtocol.PeerInfo): String? {
+        peer.ip?.let { if (transportEngine.probePeerAlive(it, peer.dataPort, timeoutMs = 1500)) return it }
+        if (!isBleLinked(peer)) return null
+        emitLog("[准备高速通道] 正在通过蓝牙请求 ${peer.deviceName} 临时开启热点...")
+        requestPeerToWakeP2p(peer = peer)
+        val deadline = System.currentTimeMillis() + 45_000L
+        while (System.currentTimeMillis() < deadline) {
+            delay(500L)
+            val ip = peer.ip ?: continue
+            if (hotspotLink.networkFor(ip) == null && !wifiP2pManager.isSubnetAlreadyReachable(ip)) continue
+            if (transportEngine.probePeerAlive(ip, peer.dataPort, timeoutMs = 1000)) return ip
+        }
+        emitLog("[准备高速通道] 等待 ${peer.deviceName} 的热点超时")
+        return null
     }
 
     /**
@@ -1188,32 +1333,40 @@ class P2pTransferService : Service() {
         targetPeer: P2pProtocol.PeerInfo? = connectedPeer
     ) {
         val resolvedPeer = targetPeer ?: discoveredPeers.values.firstOrNull { it.ip == destIp } ?: connectedPeer
-        val finalIp = resolvedPeer?.ip ?: destIp
-        val finalName = resolvedPeer?.deviceName ?: finalIp
+        val finalName = resolvedPeer?.deviceName ?: (resolvedPeer?.ip ?: destIp)
 
         serviceScope.launch {
-            emitLog("[准备定向发送文件 → $finalName] ${file.name} (${file.length()} B) [$finalIp]")
-            val ok = transportEngine.sendFile(finalIp, file)
+            emitLog("[准备定向发送文件 → $finalName] ${file.name} (${file.length()} B)")
+            val ip = if (resolvedPeer != null) ensureWifiPath(resolvedPeer) else destIp
+            if (ip == null) {
+                emitLog("[文件发送失败 → $finalName] 未能建立 Wi-Fi 高速通道 (对方不在线或热点未开启)")
+                return@launch
+            }
+            val ok = transportEngine.sendFile(ip, file)
             if (ok) {
-                emitLog("[文件发送成功 → $finalName] ${file.name} 校验通过，闲置15s后自动释放 P2P 省电")
+                emitLog("[文件发送成功 → $finalName] ${file.name} 校验通过，闲置15s后自动释放 Wi-Fi 通道省电")
             } else {
-                emitLog("[文件发送提示] 正在定向唤醒 $finalName ($finalIp) 的高速通道...")
-                requestPeerToWakeP2p(finalIp, targetDeviceId = resolvedPeer?.deviceId)
+                emitLog("[文件发送失败 → $finalName] ${file.name} 传输中断 ($ip)")
             }
         }
     }
 
-    fun requestPeerToWakeP2p(destIp: String = targetPeerIp, targetDeviceId: String? = connectedPeer?.deviceId) {
+    fun requestPeerToWakeP2p(
+        destIp: String = targetPeerIp,
+        targetDeviceId: String? = connectedPeer?.deviceId,
+        peer: P2pProtocol.PeerInfo? = null
+    ) {
         powerPolicy.onHandshakeStarted()
         val header = JSONObject().apply {
             put("device_id", deviceId)
             put("device_name", deviceName)
             put("platform", "android")
             put("reason", "file_transfer")
-            targetDeviceId?.takeIf { !it.startsWith("p2p") }?.let { put("target_device_id", it) }
+            (peer?.deviceId ?: targetDeviceId)?.takeIf { !it.startsWith("p2p") }?.let { put("target_device_id", it) }
             put("timestamp", System.currentTimeMillis())
         }
         val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.P2P_WAKE_REQUEST, header)
+        if (peer != null && sendToPeer(peer, frame, tcp = false)) return
         bleChannel.broadcastFrameToDiscoveredBlePeers(frame, isClipboard = false)
         // Send unicast to target IP instead of broadcasting to all devices
         transportEngine.sendControlFrameUdp(frame, destIp)
@@ -1249,6 +1402,7 @@ class P2pTransferService : Service() {
             put("timestamp", System.currentTimeMillis())
         }
         val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.P2P_TEARDOWN, header)
+        if (targetPeer != null && sendToPeer(targetPeer, frame)) return
         val destIp = targetPeer?.ip ?: targetPeerIp
         transportEngine.sendControlFrameUdp(frame, destIp)
         transportEngine.sendControlFrameTcp(frame, destIp, targetPeer?.dataPort ?: P2pProtocol.DATA_TCP_PORT)
@@ -1268,6 +1422,9 @@ class P2pTransferService : Service() {
         val remotePlatform = frame.header.optString("platform", "windows")
         val remotePort = frame.header.optInt("data_port", P2pProtocol.DATA_TCP_PORT)
         val ipAddr = if (senderAddr.contains(".")) senderAddr else null
+        // BLE frames carry the link's MAC address instead of an IP.
+        val viaBle = ipAddr == null && senderAddr.contains(":")
+        val bleLinked = viaBle && bleChannel.isCentralLinked(senderAddr)
 
         val peer = P2pProtocol.PeerInfo(
             deviceId = remoteId,
@@ -1282,9 +1439,11 @@ class P2pTransferService : Service() {
         )
         val isNewOrChanged = upsertPeer(peer)
         val storedPeer = discoveredPeers[remoteId] ?: peer
+        if (bleLinked) storedPeer.bleAddress = senderAddr
         val trusted = isTrustedPeer(storedPeer)
         val peerManuallyDisconnected = isPeerManuallyDisconnected(storedPeer)
         val wasConnectedBefore = storedPeer.isConnected
+        val linkLabel = ipAddr ?: "蓝牙"
 
         val hotspotSsid = frame.header.optString("hotspot_ssid", "")
         if (trusted && hotspotSsid.isNotEmpty()) {
@@ -1294,13 +1453,13 @@ class P2pTransferService : Service() {
         // ONLY auto-connect if the peer is ALREADY a trusted (`★已信任`) device!
         // Stranger devices must NEVER auto-connect without manual user approval.
         val isTeardown = frame.type == P2pProtocol.FrameType.P2P_TEARDOWN
-        if (!isTeardown && !isManuallyDisconnected && !peerManuallyDisconnected && trusted && ipAddr != null) {
+        if (!isTeardown && !isManuallyDisconnected && !peerManuallyDisconnected && trusted && (ipAddr != null || bleLinked)) {
             val wasConnected = storedPeer.isConnected && (connectedPeer?.deviceId == remoteId)
             storedPeer.isConnected = true
             rememberTrustedPeer(storedPeer)
             if (connectedPeer == null || connectedPeer?.deviceId == remoteId) {
                 connectedPeer = storedPeer
-                targetPeerIp = ipAddr
+                if (ipAddr != null) targetPeerIp = ipAddr
                 updateConnectionNotification()
             }
             serviceScope.launch {
@@ -1308,7 +1467,7 @@ class P2pTransferService : Service() {
                 uiCallback?.onPeersUpdated(getPeerList())
             }
             if (!wasConnected) {
-                emitLog("[自动重连成功] 已自动恢复与 ★$remoteName ($ipAddr) 的连接")
+                emitLog("[自动重连成功] 已自动恢复与 ★$remoteName ($linkLabel) 的连接")
             }
         } else if (!isTeardown && !peerManuallyDisconnected && trusted && (connectedPeer?.deviceId == remoteId || (ipAddr != null && connectedPeer?.ip == ipAddr))) {
             storedPeer.isConnected = true
@@ -1326,10 +1485,14 @@ class P2pTransferService : Service() {
                 val isReply = frame.header.optBoolean("is_reply", false)
                 if (isNewOrChanged) {
                     val star = if (trusted) "★已信任 " else "[陌生设备] "
-                    emitLog("[发现设备] $star$remoteName [$remotePlatform] (${ipAddr ?: senderAddr})")
+                    emitLog("[发现设备] $star$remoteName [$remotePlatform] ($linkLabel)")
                 }
                 if (!isReply) {
-                    announcePresenceHello(targetIp = ipAddr, isReply = true)
+                    if (bleLinked) {
+                        bleChannel.notifyFrame(senderAddr, buildHelloFrame(isReply = true))
+                    } else {
+                        announcePresenceHello(targetIp = ipAddr, isReply = true)
+                    }
                 }
             }
 
@@ -1404,6 +1567,8 @@ class P2pTransferService : Service() {
                 val goIp = frame.header.optString("go_ip", P2pProtocol.WINDOWS_GO_DEFAULT_IP)
                 if (!isManuallyDisconnected && !peerManuallyDisconnected && (trusted || storedPeer.isConnected) && ssid.isNotEmpty() && pass.isNotEmpty()) {
                     emitLog("[收到对端P2P凭据 ← $remoteName] 正在免确认直连 $ssid ($goIp)...")
+                    pendingP2pPeer = storedPeer
+                    if (goIp.startsWith("192.168.137.")) rememberPeerHotspot(remoteName, ssid, pass)
                     connectToPeerBurstGroup(ssid, pass, goIp)
                 }
             }
@@ -1452,10 +1617,11 @@ class P2pTransferService : Service() {
         val notif = buildInteractiveNotification(contentText)
         try {
             if (Build.VERSION.SDK_INT >= 34) {
+                // connectedDevice: no daily runtime cap (dataSync is limited to 6h/24h on Android 15+).
                 startForeground(
                     NOTIFICATION_ID,
                     notif,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                 )
             } else {
                 startForeground(NOTIFICATION_ID, notif)
@@ -1471,26 +1637,20 @@ class P2pTransferService : Service() {
         }
     }
 
+    /**
+     * The service stays foreground for its whole lifetime: OEM ROMs (Honor MagicOS, MIUI, ColorOS) freeze
+     * background processes, and a frozen app cannot answer the PC's BLE GATT writes or reconnects.
+     * WakeLock / WifiLock stay released while idle, so this costs a notification, not battery.
+     */
     private fun updateConnectionNotification() {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         val cur = connectedPeer
-        if (cur != null) {
-            // Keep service in foreground state while actively connected to a peer so OEM ROMs
-            // (Honor MagicOS hwpged / MIUI / ColorOS) do not cgroup-freeze the UDP receiver in background!
-            // Note: WakeLock & WifiLock remain RELEASED in DEEP_IDLE so battery impact is near zero.
-            promoteOrUpdateForegroundNotification(
-                "已连接: ${cur.deviceName} (${cur.ip ?: "直连"}) — 后台实时接收剪贴板与文件中"
-            )
-        } else if (powerPolicy.currentState == P2pProtocol.PowerState.DEEP_IDLE) {
-            try {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } catch (_: Throwable) {
-            }
-            try {
-                nm.cancel(NOTIFICATION_ID)
-            } catch (_: Throwable) {
-            }
+        val text = if (cur != null) {
+            val link = cur.ip ?: if (isBleLinked(cur)) "蓝牙" else "直连"
+            "已连接: ${cur.deviceName} ($link) — 后台实时接收剪贴板与文件中"
+        } else {
+            "待命中 — 低功耗蓝牙等待电脑连接"
         }
+        promoteOrUpdateForegroundNotification(text)
     }
 
     private fun createNotificationChannel() {

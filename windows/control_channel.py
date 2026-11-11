@@ -79,6 +79,8 @@ class LowPowerControlChannel:
         self.on_pair_response = on_pair_response
 
         self.hotspot_info: Optional[Dict[str, str]] = None
+        # Set by the coordinator when BLE is available (ble_link.BleCentralLink).
+        self.ble_link: Optional[Any] = None
         self._peers: Dict[str, PeerInfo] = {}
         self._peers_lock = threading.Lock()
         self._sock: Optional[socket.socket] = None
@@ -157,12 +159,12 @@ class LowPowerControlChannel:
         if self._recv_thread and self._recv_thread.is_alive():
             self._recv_thread.join(timeout=1.5)
 
-    def announce_presence_once(self, target_ip: Optional[str] = None) -> None:
+    def announce_presence_once(self, target_ip: Optional[str] = None, target_ble: Optional[str] = None) -> None:
         """
         Send a single event-driven HELLO packet (no background timer loop!).
         """
         frame = encode_frame(FrameType.HELLO, self._hello_header(is_reply=False))
-        self._send_control_bytes(frame, target_ip=target_ip)
+        self._send_control_bytes(frame, target_ip=target_ip, target_ble=target_ble)
 
     def _hello_header(self, is_reply: bool) -> Dict[str, Any]:
         hdr: Dict[str, Any] = {
@@ -183,6 +185,7 @@ class LowPowerControlChannel:
         self,
         text: str,
         target_ip: Optional[str] = None,
+        target_ble: Optional[str] = None,
         target_device_id: Optional[str] = None,
     ) -> bool:
         """
@@ -210,7 +213,7 @@ class LowPowerControlChannel:
             hdr,
             payload=payload,
         )
-        self._send_control_bytes(frame, target_ip=target_ip)
+        self._send_control_bytes(frame, target_ip=target_ip, target_ble=target_ble)
         return True
 
     def send_p2p_wake_request(
@@ -218,6 +221,7 @@ class LowPowerControlChannel:
         reason: str = "file_transfer",
         prefer_go_platform: str = "android",
         target_ip: Optional[str] = None,
+        target_ble: Optional[str] = None,
         target_device_id: Optional[str] = None,
     ) -> None:
         """
@@ -234,7 +238,7 @@ class LowPowerControlChannel:
         if target_device_id:
             hdr["target_device_id"] = target_device_id
         frame = encode_frame(FrameType.P2P_WAKE_REQUEST, hdr)
-        self._send_control_bytes(frame, target_ip=target_ip)
+        self._send_control_bytes(frame, target_ip=target_ip, target_ble=target_ble)
 
     def send_p2p_group_ready(
         self,
@@ -243,6 +247,7 @@ class LowPowerControlChannel:
         go_ip: str,
         port: int = DATA_TCP_PORT,
         target_ip: Optional[str] = None,
+        target_ble: Optional[str] = None,
         target_device_id: Optional[str] = None,
     ) -> None:
         """
@@ -261,11 +266,12 @@ class LowPowerControlChannel:
         if target_device_id:
             hdr["target_device_id"] = target_device_id
         frame = encode_frame(FrameType.P2P_GROUP_READY, hdr)
-        self._send_control_bytes(frame, target_ip=target_ip)
+        self._send_control_bytes(frame, target_ip=target_ip, target_ble=target_ble)
 
     def send_p2p_teardown(
         self,
         target_ip: Optional[str] = None,
+        target_ble: Optional[str] = None,
         target_device_id: Optional[str] = None,
     ) -> bytes:
         """
@@ -279,12 +285,13 @@ class LowPowerControlChannel:
         if target_device_id and not target_device_id.startswith("p2p-"):
             hdr["target_device_id"] = target_device_id
         frame = encode_frame(FrameType.P2P_TEARDOWN, hdr)
-        self._send_control_bytes(frame, target_ip=target_ip)
+        self._send_control_bytes(frame, target_ip=target_ip, target_ble=target_ble)
         return frame
 
     def send_pair_request(
         self,
         target_ip: Optional[str] = None,
+        target_ble: Optional[str] = None,
         target_device_id: Optional[str] = None,
     ) -> bytes:
         """Send an explicit connection/pairing request to a peer."""
@@ -298,13 +305,14 @@ class LowPowerControlChannel:
         if target_device_id and not target_device_id.startswith("p2p-"):
             hdr["target_device_id"] = target_device_id
         frame = encode_frame(FrameType.PAIR_REQUEST, hdr)
-        self._send_control_bytes(frame, target_ip=target_ip)
+        self._send_control_bytes(frame, target_ip=target_ip, target_ble=target_ble)
         return frame
 
     def send_pair_response(
         self,
         accepted: bool,
         target_ip: Optional[str] = None,
+        target_ble: Optional[str] = None,
         target_device_id: Optional[str] = None,
     ) -> bytes:
         """Send an explicit accept/reject response to a peer's connection request."""
@@ -319,7 +327,7 @@ class LowPowerControlChannel:
         if target_device_id and not target_device_id.startswith("p2p-"):
             hdr["target_device_id"] = target_device_id
         frame = encode_frame(FrameType.PAIR_RESPONSE, hdr)
-        self._send_control_bytes(frame, target_ip=target_ip)
+        self._send_control_bytes(frame, target_ip=target_ip, target_ble=target_ble)
         return frame
 
     def handle_ble_notification_chunk(self, chunk: bytes, sender_address: str = "") -> None:
@@ -329,7 +337,14 @@ class LowPowerControlChannel:
         """
         full_frame = self._ble_reassembler.feed(chunk)
         if full_frame is not None:
-            self._handle_raw_frame(full_frame, sender_ip=sender_address)
+            self.handle_ble_frame(full_frame, sender_address)
+
+    def handle_ble_frame(self, frame: bytes, ble_address: str) -> None:
+        """Handle a complete frame received over the BLE link with the phone at `ble_address`."""
+        try:
+            self._handle_raw_frame(frame, sender_ip=ble_address, via_ble=True)
+        except Exception as exc:
+            logger.debug("Ignored malformed BLE frame from %s: %s", ble_address, exc)
 
     def upsert_discovered_peer(self, peer: PeerInfo, notify: bool = True) -> None:
         with self._peers_lock:
@@ -351,7 +366,23 @@ class LowPowerControlChannel:
         if notify and self.on_peer_discovered:
             self.on_peer_discovered(peer)
 
-    def _send_control_bytes(self, frame: bytes, target_ip: Optional[str] = None) -> None:
+    def _send_control_bytes(
+        self,
+        frame: bytes,
+        target_ip: Optional[str] = None,
+        target_ble: Optional[str] = None,
+    ) -> None:
+        """
+        Unicast to `target_ip` and/or `target_ble`; with neither, broadcast on all LANs and BLE links.
+        A BLE-only target never falls back to a LAN broadcast.
+        """
+        if target_ble and self.ble_link is not None:
+            self.ble_link.send_frame(target_ble, frame)
+        if target_ble and not target_ip:
+            return
+        if not target_ip and not target_ble and self.ble_link is not None:
+            for address in self.ble_link.linked_addresses():
+                self.ble_link.send_frame(address, frame)
         if not self._sock:
             return
         targets = set()
@@ -424,7 +455,8 @@ class LowPowerControlChannel:
             except Exception as exc:
                 logger.debug("Ignored malformed control packet from %s: %s", sender_ip, exc)
 
-    def _handle_raw_frame(self, data: bytes, sender_ip: str) -> None:
+    def _handle_raw_frame(self, data: bytes, sender_ip: str, via_ble: bool = False) -> None:
+        """`sender_ip` is the BLE address of the link when `via_ble` is set."""
         ftype, header, payload = decode_frame_from_bytes(data)
         remote_id = header.get("device_id", "")
         if not remote_id or remote_id == self.device_id:
@@ -447,28 +479,38 @@ class LowPowerControlChannel:
                     device_id=remote_id,
                     device_name=remote_name,
                     platform=remote_platform,
-                    ip=sender_ip,
+                    ip=None if via_ble else sender_ip,
                     data_port=remote_data_port,
                     last_seen=time.time(),
                     p2p_ssid=header.get("ssid"),
                     p2p_passphrase=header.get("passphrase"),
                     p2p_go_ip=header.get("go_ip"),
-                    discovery_source="lan",
+                    ble_address=sender_ip if via_ble else None,
+                    discovery_source="ble" if via_ble else "lan",
                 )
                 self._peers[remote_id] = peer
             else:
-                if peer.device_name != remote_name or peer.ip != sender_ip:
+                if via_ble:
+                    if peer.ble_address != sender_ip:
+                        changed = True
+                    peer.ble_address = sender_ip
+                    if not peer.ip:
+                        peer.discovery_source = "ble"
+                else:
+                    if peer.ip != sender_ip:
+                        changed = True
+                    if sender_ip and "." in sender_ip:
+                        peer.ip = sender_ip
+                    peer.discovery_source = "lan"
+                if peer.device_name != remote_name:
                     changed = True
                 peer.device_name = remote_name
-                if sender_ip and "." in sender_ip:
-                    peer.ip = sender_ip
                 if header.get("ssid"):
                     peer.p2p_ssid = header.get("ssid")
                 if header.get("passphrase"):
                     peer.p2p_passphrase = header.get("passphrase")
                 if header.get("go_ip"):
                     peer.p2p_go_ip = header.get("go_ip")
-                peer.discovery_source = "lan"
                 peer.last_seen = time.time()
 
             # Remove temporary scan placeholder if we now know the real peer
@@ -482,7 +524,10 @@ class LowPowerControlChannel:
         if ftype == FrameType.HELLO:
             if not header.get("is_reply"):
                 reply = encode_frame(FrameType.HELLO, self._hello_header(is_reply=True))
-                if sender_ip and "." in sender_ip and self._sock:
+                if via_ble:
+                    if self.ble_link is not None:
+                        self.ble_link.send_frame(sender_ip, reply)
+                elif sender_ip and "." in sender_ip and self._sock:
                     try:
                         self._sock.sendto(reply, (sender_ip, self.udp_port))
                     except OSError:

@@ -23,6 +23,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from ble_link import BleCentralLink
 from clipboard_win32 import ClipboardSyncController, get_clipboard_text
 from control_channel import LowPowerControlChannel
 from protocol import (
@@ -77,6 +78,16 @@ def save_device_name(name: str) -> None:
     _write_config_dict(cfg)
 
 
+def load_hotspot_always_on() -> bool:
+    return bool(_read_config_dict().get("hotspot_always_on", False))
+
+
+def save_hotspot_always_on(enabled: bool) -> None:
+    cfg = _read_config_dict()
+    cfg["hotspot_always_on"] = bool(enabled)
+    _write_config_dict(cfg)
+
+
 def load_trusted_peers() -> Dict[str, str]:
     """Return mapping of `{device_id_or_name: friendly_name}` for auto-reconnect."""
     raw = _read_config_dict().get("trusted_peers", {})
@@ -125,8 +136,10 @@ class ConnectP2pWindowsNode:
         on_connected_peer_change: Optional[Callable[[Optional[PeerInfo]], None]] = None,
         on_progress: Optional[Callable[[TransferProgress], None]] = None,
         on_pair_request_prompt: Optional[Callable[[PeerInfo], None]] = None,
+        enable_ble: bool = True,
     ) -> None:
         self.device_id = f"win-{uuid.getnode():012x}"
+        self.enable_ble = enable_ble
         self.device_name = device_name or load_saved_device_name() or f"WinPC-{socket.gethostname()}"
         self.download_dir = Path(download_dir or (Path.home() / "Downloads" / "ConnectP2P"))
         self.auto_clipboard_sync = auto_clipboard_sync
@@ -183,6 +196,16 @@ class ConnectP2pWindowsNode:
             on_local_clipboard_change=self._handle_local_clipboard_change
         )
 
+        # BLE is the default link to phones; the Wi-Fi hotspot only comes up for bulk transfers,
+        # unless the user opts into keeping it on (phones without BLE, lowest latency).
+        self.ble = BleCentralLink(
+            on_frame=self.control.handle_ble_frame,
+            on_link_change=self._handle_ble_link_change,
+            ping_frame=lambda: encode_frame(FrameType.HELLO, self.control._hello_header(is_reply=False)),
+        )
+        self.control.ble_link = self.ble
+        self.hotspot_always_on = load_hotspot_always_on()
+
         self._p2p_ready_event = threading.Event()
         self._liveness_thread: Optional[threading.Thread] = None
         self._hotspot_thread: Optional[threading.Thread] = None
@@ -206,25 +229,65 @@ class ConnectP2pWindowsNode:
             daemon=True,
         )
         self._liveness_thread.start()
+        if self.enable_ble:
+            if self.ble.start():
+                self._emit_log("[低功耗蓝牙] 已启动：正在搜索附近的 ConnectP2P 手机 (平时剪贴板与状态走蓝牙，传文件时才开热点)")
+            else:
+                self._emit_log("[低功耗蓝牙] 不可用 (未安装 bleak：pip install bleak)，将使用局域网或电脑热点连接")
         self._emit_log(
-            f"[待机低功耗态 DEEP_IDLE] 已启动：TCP端口={bound_tcp}, UDP控制端口={self.control.udp_port} (Wi-Fi P2P当前关闭以省电)"
+            f"[待机低功耗态 DEEP_IDLE] 已启动：TCP端口={bound_tcp}, UDP控制端口={self.control.udp_port}"
         )
 
     def stop(self) -> None:
         self._running = False
         # Notify all connected peers immediately before closing sockets
         for p in list(self.control.peers.values()):
-            if p.is_connected and p.ip:
-                try:
-                    td = self.control.send_p2p_teardown(target_ip=p.ip, target_device_id=p.device_id)
-                    self.transport.send_control_frame_over_tcp(p.ip, td, target_port=p.data_port, timeout=0.6)
-                except Exception:
-                    pass
+            if not p.is_connected:
+                continue
+            ip, ble = self._targets(p)
+            try:
+                td = self.control.send_p2p_teardown(target_ip=ip, target_ble=ble, target_device_id=p.device_id)
+                if ip:
+                    self.transport.send_control_frame_over_tcp(ip, td, target_port=p.data_port, timeout=0.6)
+            except Exception:
+                pass
+        time.sleep(0.3)  # let queued BLE writes go out before the link is closed
         self.clipboard.stop()
         self._hotspot_wanted = False
+        self.ble.stop()
         self.p2p_controller.teardown()
         self.control.stop()
         self.transport.stop_server()
+
+    def _targets(self, peer: Optional[PeerInfo]) -> tuple[Optional[str], Optional[str]]:
+        """(IP, BLE address) the peer is currently reachable on; either may be None."""
+        if peer is None:
+            return None, None
+        ble = peer.ble_address if self.ble.is_linked(peer.ble_address) else None
+        return peer.ip, ble
+
+    def _handle_ble_link_change(self, address: str, up: bool) -> None:
+        if up:
+            # Introduce ourselves; the phone's HELLO reply identifies it and, if trusted, connects it.
+            self.control.announce_presence_once(target_ble=address)
+            return
+        peer = next((p for p in self.control.peers.values() if p.ble_address == address), None)
+        if peer is None:
+            return
+        peer.ble_address = None
+        if peer.is_connected and not (peer.ip and self.transport.probe_peer_alive(peer.ip, peer.data_port, timeout=1.5)):
+            self._mark_peer_disconnected(peer, f"[连接状态更新] \"{peer.device_name}\" 的蓝牙连接已断开")
+
+    def _mark_peer_disconnected(self, peer: PeerInfo, log_message: str) -> None:
+        peer.is_connected = False
+        self._emit_log(log_message)
+        if self.connected_peer and self.connected_peer.device_id == peer.device_id:
+            remaining = [p for p in self.control.peers.values() if p.is_connected and p.device_id != peer.device_id]
+            self.connected_peer = remaining[0] if remaining else None
+            if self.on_connected_peer_change:
+                self.on_connected_peer_change(self.connected_peer)
+        if self.on_peers_updated:
+            self.on_peers_updated(list(self.control.peers.values()))
 
     def set_device_name(self, new_name: str) -> None:
         cleaned = new_name.strip()
@@ -254,6 +317,10 @@ class ConnectP2pWindowsNode:
             alive = self.transport.probe_peer_alive(peer.ip, peer.data_port, timeout=1.5)
             if alive:
                 peer.last_seen = time.time()
+            elif self.ble.is_linked(peer.ble_address):
+                # Still reachable over BLE; only the Wi-Fi path is gone (e.g. on-demand hotspot stopped).
+                peer.ip = None
+                status_changed = True
             else:
                 peer.is_connected = False
                 status_changed = True
@@ -386,25 +453,35 @@ class ConnectP2pWindowsNode:
         if self.on_peers_updated:
             self.on_peers_updated(list(self.control.peers.values()))
 
-        if peer.ip:
-            req_frame = self.control.send_pair_request(target_ip=peer.ip, target_device_id=peer.device_id)
-            self.transport.send_control_frame_over_tcp(peer.ip, req_frame, target_port=peer.data_port)
+        ip, ble = self._targets(peer)
+        if ip or ble:
+            req_frame = self.control.send_pair_request(target_ip=ip, target_ble=ble, target_device_id=peer.device_id)
+            if ip:
+                self.transport.send_control_frame_over_tcp(ip, req_frame, target_port=peer.data_port)
 
-        self._emit_log(f"[已连接信任设备] ★{peer.device_name} ({peer.ip}) -> 正在自动同步剪贴板")
+        self._emit_log(f"[已连接信任设备] ★{peer.device_name} ({ip or '蓝牙'}) -> 正在自动同步剪贴板")
         clip_txt = get_clipboard_text()
         if clip_txt:
-            self.sync_clipboard_text(clip_txt, target_ip=peer.ip, target_peer=peer)
+            self.sync_clipboard_text(clip_txt, target_peer=peer)
         return True
+
+    def _unicast_targets(self, peer: PeerInfo) -> tuple[Optional[str], Optional[str]]:
+        """Like `_targets`, but falls back to the phone's default group IP when nothing is known."""
+        ip, ble = self._targets(peer)
+        if not ip and not ble:
+            ip = ANDROID_GO_DEFAULT_IP
+        return ip, ble
 
     def request_pairing(self, peer: PeerInfo) -> bool:
         """
         Send a `PAIR_REQUEST` to a stranger device and wait for manual approval on the remote side.
         """
-        dest_ip = peer.ip or ANDROID_GO_DEFAULT_IP
-        req_frame = self.control.send_pair_request(target_ip=dest_ip, target_device_id=peer.device_id)
-        self.transport.send_control_frame_over_tcp(dest_ip, req_frame, target_port=peer.data_port)
+        dest_ip, dest_ble = self._unicast_targets(peer)
+        req_frame = self.control.send_pair_request(target_ip=dest_ip, target_ble=dest_ble, target_device_id=peer.device_id)
+        if dest_ip:
+            self.transport.send_control_frame_over_tcp(dest_ip, req_frame, target_port=peer.data_port)
         self._emit_log(
-            f"[等待对方同意连接] 已向陌生设备 \"{peer.device_name}\" ({dest_ip}) 发送连接请求，请在对端设备上点击『同意连接』..."
+            f"[等待对方同意连接] 已向陌生设备 \"{peer.device_name}\" ({dest_ip or '蓝牙'}) 发送连接请求，请在对端设备上点击『同意连接』..."
         )
         return True
 
@@ -412,13 +489,15 @@ class ConnectP2pWindowsNode:
         """
         Called when local user approves or rejects an incoming connection request from a stranger device.
         """
-        dest_ip = peer.ip or ANDROID_GO_DEFAULT_IP
+        dest_ip, dest_ble = self._unicast_targets(peer)
         resp_frame = self.control.send_pair_response(
             accepted=accepted,
             target_ip=dest_ip,
+            target_ble=dest_ble,
             target_device_id=peer.device_id,
         )
-        self.transport.send_control_frame_over_tcp(dest_ip, resp_frame, target_port=peer.data_port)
+        if dest_ip:
+            self.transport.send_control_frame_over_tcp(dest_ip, resp_frame, target_port=peer.data_port)
 
         was_connected = peer.is_connected and self.connected_peer is not None and self.connected_peer.device_id == peer.device_id
         if accepted and was_connected:
@@ -435,16 +514,16 @@ class ConnectP2pWindowsNode:
                 self.on_connected_peer_change(peer)
             if self.on_peers_updated:
                 self.on_peers_updated(list(self.control.peers.values()))
-            self._emit_log(f"[已同意连接] 已同意 \"{peer.device_name}\" ({dest_ip}) 的连接请求并加入 ★已信任设备")
+            self._emit_log(f"[已同意连接] 已同意 \"{peer.device_name}\" ({dest_ip or '蓝牙'}) 的连接请求并加入 ★已信任设备")
             if self.auto_clipboard_sync:
                 clip_txt = get_clipboard_text()
                 if clip_txt:
-                    self.sync_clipboard_text(clip_txt, target_ip=peer.ip, target_peer=peer)
+                    self.sync_clipboard_text(clip_txt, target_peer=peer)
         else:
             peer.is_connected = False
             if self.on_peers_updated:
                 self.on_peers_updated(list(self.control.peers.values()))
-            self._emit_log(f"[已拒绝连接] 已拒绝陌生设备 \"{peer.device_name}\" ({dest_ip}) 的连接请求")
+            self._emit_log(f"[已拒绝连接] 已拒绝陌生设备 \"{peer.device_name}\" ({dest_ip or '蓝牙'}) 的连接请求")
 
     def disconnect_peer(self, peer: PeerInfo, forget_trust: bool = False) -> None:
         """
@@ -462,9 +541,11 @@ class ConnectP2pWindowsNode:
                 self.trusted_peers.pop(f"name:{peer.device_name}", None)
             remove_trusted_peer(peer)
 
-        td_frame = self.control.send_p2p_teardown(target_ip=peer.ip, target_device_id=peer.device_id)
-        if peer.ip:
-            self.transport.send_control_frame_over_tcp(peer.ip, td_frame, target_port=peer.data_port, timeout=1.0)
+        td_ip, td_ble = self._targets(peer)
+        if td_ip or td_ble:
+            td_frame = self.control.send_p2p_teardown(target_ip=td_ip, target_ble=td_ble, target_device_id=peer.device_id)
+            if td_ip:
+                self.transport.send_control_frame_over_tcp(td_ip, td_frame, target_port=peer.data_port, timeout=1.0)
 
         if self.connected_peer and self.connected_peer.device_id == peer.device_id:
             remaining = [
@@ -510,29 +591,37 @@ class ConnectP2pWindowsNode:
             self.on_peers_updated(list(self.control.peers.values()))
         self._emit_log("[已手动断开连接] 当前无活动设备连接")
 
-    def start_p2p_group_on_demand(self) -> P2pGroupCredentials:
+    def start_p2p_group_on_demand(self, persistent: bool = False, announce: bool = True) -> P2pGroupCredentials:
         """
-        Explicitly or automatically spin up Windows Wi-Fi Direct Autonomous GO (`DIRECT-CP-...`).
-        Uses deterministic SSID/Passphrase so Android phones can scan and 1-tap connect without typing!
+        Bring up the Windows Mobile Hotspot (`DIRECT-CP-...`, 192.168.137.1; the laptop's own Wi-Fi stays up).
+
+        - persistent: kept up by the keep-alive loop until `stop_hotspot()` ("hotspot always on" option).
+        - otherwise on demand: the idle watchdog stops it once no transfer has used it for a while and the
+          phones on it are still reachable over BLE.
         """
         self._manually_disconnected = False
-        self._hotspot_wanted = True
+        if persistent:
+            self._hotspot_wanted = True
         creds = self.p2p_controller.start_autonomous_group_owner(port=self.transport.bound_port)
         self._hotspot_creds = creds
         if creds.hotspot_on:
             self.control.hotspot_info = {"ssid": creds.ssid, "passphrase": creds.passphrase, "go_ip": creds.go_ip}
-            self.control.send_p2p_group_ready(
-                ssid=creds.ssid,
-                passphrase=creds.passphrase,
-                go_ip=creds.go_ip,
-                port=creds.port,
-            )
-            self._emit_log(
-                f"[本机直连热点已开启] SSID={creds.ssid} ({creds.go_ip})，电脑主 Wi-Fi 不受影响；手机端点击该电脑即可连接"
-            )
+            if not persistent:
+                # Room for the phone to join and start the transfer before the idle teardown kicks in.
+                self.watchdog.set_state(PowerState.P2P_BURST_ACTIVE)
+                self.watchdog.touch_activity(timeout_sec=90.0)
+            if announce:
+                self.control.send_p2p_group_ready(
+                    ssid=creds.ssid,
+                    passphrase=creds.passphrase,
+                    go_ip=creds.go_ip,
+                    port=creds.port,
+                )
+            mode = "常开" if persistent else "临时"
+            self._emit_log(f"[电脑热点已开启·{mode}] SSID={creds.ssid} ({creds.go_ip})，电脑主 Wi-Fi 不受影响")
         else:
             self._emit_log("[热点开启失败] Windows 移动热点未能开启（请确认 Wi-Fi 已打开，且系统设置里的『移动热点』可手动开启）")
-        if self._hotspot_thread is None or not self._hotspot_thread.is_alive():
+        if persistent and (self._hotspot_thread is None or not self._hotspot_thread.is_alive()):
             self._hotspot_thread = threading.Thread(
                 target=self._hotspot_keepalive_loop,
                 name="ConnectP2PHotspotKeepalive",
@@ -545,7 +634,50 @@ class ConnectP2pWindowsNode:
         self._hotspot_wanted = False
         self.control.hotspot_info = None
         self.p2p_controller.teardown()
+        for p in self.control.peers.values():
+            if p.ip and p.ip.startswith("192.168.137."):
+                p.ip = None
         self._emit_log("[热点已关闭] Windows 移动热点已关闭")
+
+    def set_hotspot_always_on(self, enabled: bool) -> None:
+        self.hotspot_always_on = enabled
+        save_hotspot_always_on(enabled)
+        if enabled:
+            self.start_p2p_group_on_demand(persistent=True)
+        elif self.p2p_controller.is_active and self.watchdog.active_transfers == 0:
+            self.stop_hotspot()
+
+    def _ensure_wifi_path(self, peer: PeerInfo, timeout: float = 45.0) -> Optional[str]:
+        """
+        Returns an IP the peer answers on for bulk transfers. For a BLE-only phone this brings the hotspot
+        up, tells the phone over BLE (P2P_GROUP_READY), and waits for its HELLO from the hotspot subnet.
+        """
+        if peer.ip and self.transport.probe_peer_alive(peer.ip, peer.data_port, timeout=1.5):
+            return peer.ip
+        _ip, ble = self._targets(peer)
+        if not ble:
+            return None
+        self._emit_log(f"[准备高速通道] 正在临时开启电脑热点，并通过蓝牙通知 {peer.device_name} 接入...")
+        creds = self.start_p2p_group_on_demand(announce=False)
+        if not creds.hotspot_on:
+            return None
+        self.control.send_p2p_group_ready(
+            ssid=creds.ssid,
+            passphrase=creds.passphrase,
+            go_ip=creds.go_ip,
+            port=creds.port,
+            target_ble=ble,
+            target_device_id=peer.device_id,
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.5)
+            ip = peer.ip
+            if ip and ip.startswith("192.168.137.") and self.transport.probe_peer_alive(ip, peer.data_port, timeout=1.0):
+                self._emit_log(f"[准备高速通道] {peer.device_name} 已接入电脑热点 ({ip})")
+                return ip
+        self._emit_log(f"[准备高速通道] 等待 {peer.device_name} 接入热点超时")
+        return None
 
     def _hotspot_keepalive_loop(self) -> None:
         """
@@ -618,20 +750,21 @@ class ConnectP2pWindowsNode:
         target_peer: Optional[PeerInfo] = None,
     ) -> bool:
         """
-        Smart clipboard sync (Unicast to the specified target peer ONLY):
-        - If payload <= 16KB: sends directly over low-power control channel (0 Wi-Fi P2P wakeup!)
-        - If payload > 16KB: wakes up TCP burst channel on demand
+        Clipboard sync to ONE peer (never broadcast):
+        - Small text goes over BLE and/or the LAN/hotspot IP the peer is reachable on.
+        - Text too large for BLE needs Wi-Fi; a BLE-only phone gets the hotspot brought up on demand.
         """
         resolved_peer = target_peer or self.connected_peer
-        dest_ip = target_ip or (resolved_peer.ip if resolved_peer else None)
+        peer_ip, ble = self._targets(resolved_peer)
+        dest_ip = target_ip or peer_ip
         dest_id = resolved_peer.device_id if resolved_peer else None
         dest_name = resolved_peer.device_name if resolved_peer else (dest_ip or "未指定设备")
 
-        if not dest_ip:
+        if not dest_ip and not ble:
             return False
 
-        # Connect handshakes arrive over both UDP and TCP and each one triggers a sync; send a clip once.
-        clip_key = (dest_ip, hash(text))
+        # Connect handshakes arrive over several links and each one triggers a sync; send a clip once.
+        clip_key = (dest_id or dest_ip, hash(text))
         now = time.time()
         if self._last_clip_send and self._last_clip_send[0] == clip_key and now - self._last_clip_send[1] < 3.0:
             return True
@@ -639,36 +772,42 @@ class ConnectP2pWindowsNode:
 
         dest_port = resolved_peer.data_port if resolved_peer else DATA_TCP_PORT
         payload_len = len(text.encode("utf-8"))
+        preview = text.replace("\r", " ").replace("\n", " ")[:48]
         if payload_len <= MAX_INLINE_CLIPBOARD_BYTES:
-            sent_udp = self.control.send_inline_clipboard(
-                text,
-                target_ip=dest_ip,
-                target_device_id=dest_id,
-            )
-            # Also deliver over TCP if target is directly reachable: on Honor MagicOS / Android 14~17,
-            # an incoming TCP SYN immediately unfreezes the background app cgroup in <30ms!
-            sent_tcp = self.transport.send_clipboard_over_tcp(
-                dest_ip,
-                text,
-                target_port=dest_port,
-                timeout=1.2,
-                touch_burst_watchdog=False,
-            )
-            if sent_udp or sent_tcp:
-                preview = text.replace("\r", " ").replace("\n", " ")[:48]
-                self._emit_log(f"[已发送剪贴板 → {dest_name}] \"{preview}\" ({payload_len} Bytes，后台瞬时直达)")
+            # Frame = payload + encrypted header/tag; leave room for that overhead.
+            via_ble = ble is not None and payload_len + 512 <= self.ble.max_frame_bytes(ble)
+            if via_ble or dest_ip:
+                self.control.send_inline_clipboard(
+                    text,
+                    target_ip=dest_ip,
+                    target_ble=ble if via_ble else None,
+                    target_device_id=dest_id,
+                )
+                if dest_ip:
+                    # TCP as well: an incoming connection wakes a frozen background app on OEM ROMs.
+                    self.transport.send_clipboard_over_tcp(
+                        dest_ip,
+                        text,
+                        target_port=dest_port,
+                        timeout=1.2,
+                        touch_burst_watchdog=False,
+                    )
+                link = "蓝牙" if via_ble else dest_ip
+                self._emit_log(f"[已发送剪贴板 → {dest_name}] \"{preview}\" ({payload_len} Bytes · {link})")
                 return True
 
-        # Fallback for > 16KB clipboard: use TCP burst channel
+        wifi_ip = self._ensure_wifi_path(resolved_peer) if resolved_peer else dest_ip
+        if not wifi_ip:
+            self._emit_log(f"[剪贴板发送失败 → {dest_name}] 内容较大需要 Wi-Fi 通道，但未能建立")
+            return False
         ok = self.transport.send_clipboard_over_tcp(
-            dest_ip,
+            wifi_ip,
             text,
             target_port=dest_port,
             timeout=8.0,
             touch_burst_watchdog=True,
         )
         if ok:
-            preview = text.replace("\r", " ").replace("\n", " ")[:48]
             self._emit_log(f"[已发送大剪贴板 → {dest_name}] \"{preview}\" ({payload_len} Bytes)")
         return ok
 
@@ -688,24 +827,20 @@ class ConnectP2pWindowsNode:
                 if p.ip == target_ip:
                     resolved_peer = p
                     break
-        peers = list(self.control.peers.values())
-        dest_ip = target_ip or (resolved_peer.ip if resolved_peer else (peers[0].ip if peers else ANDROID_GO_DEFAULT_IP))
-        dest_port = target_port or (resolved_peer.data_port if resolved_peer else (peers[0].data_port if peers else DATA_TCP_PORT))
-        dest_id = resolved_peer.device_id if resolved_peer else None
-        dest_name = resolved_peer.device_name if resolved_peer else dest_ip
+        dest_port = resolved_peer.data_port if resolved_peer else (target_port or DATA_TCP_PORT)
+        dest_name = resolved_peer.device_name if resolved_peer else (target_ip or ANDROID_GO_DEFAULT_IP)
 
-        if not self.p2p_controller._probe_tcp(dest_ip, dest_port, timeout=1.2):
-            self._emit_log(f"[定向唤醒P2P] 目标设备 {dest_name} ({dest_ip}:{dest_port}) 处于休眠，正在唤醒高速通道...")
-            self._p2p_ready_event.clear()
-            self.control.send_p2p_wake_request(
-                reason="file_transfer",
-                target_ip=dest_ip,
-                target_device_id=dest_id,
+        if resolved_peer is not None:
+            dest_ip = self._ensure_wifi_path(resolved_peer)
+            if dest_ip is None and target_ip and self.transport.probe_peer_alive(target_ip, dest_port, timeout=1.2):
+                dest_ip = target_ip
+        else:
+            dest_ip = target_ip or ANDROID_GO_DEFAULT_IP
+        if not dest_ip:
+            self._emit_log(
+                f"[文件发送失败 → {dest_name}] 无法建立 Wi-Fi 高速通道 (对方不在同一网络且蓝牙未连接；可在电脑端勾选『热点常开』)"
             )
-            # Wait briefly in case Android responds with P2P_GROUP_READY
-            if self._p2p_ready_event.wait(timeout=3.0):
-                if resolved_peer and resolved_peer.p2p_go_ip:
-                    dest_ip = resolved_peer.p2p_go_ip
+            return False
 
         all_ok = True
         for fp in file_paths:
@@ -786,19 +921,23 @@ class ConnectP2pWindowsNode:
         trusted = self.is_trusted_peer(peer)
         peer_disc = self.is_peer_manually_disconnected(peer)
         trust_badge = " [★已信任]" if trusted else " [陌生设备]"
-        src_tag = "Wi-Fi直连热点" if peer.discovery_source == "p2p_scan" else f"在线 {peer.ip}:{peer.data_port}"
+        if peer.discovery_source == "p2p_scan":
+            src_tag = "Wi-Fi直连热点"
+        elif peer.ip:
+            src_tag = f"在线 {peer.ip}:{peer.data_port}"
+        else:
+            src_tag = "低功耗蓝牙"
         self._emit_log(f"[发现设备] {peer.device_name}{trust_badge} [{peer.platform}] ({src_tag})")
 
-        # ONLY auto-connect on LAN/P2P virtual subnet (`discovery_source == 'lan'`) if the peer is ALREADY trusted!
+        # ONLY auto-connect over an existing link (LAN/hotspot IP or BLE) if the peer is ALREADY trusted!
         # Do NOT auto-switch the laptop's main Wi-Fi card (`p2p_scan`) in the background, because switching
         # the primary WLAN adapter to a phone's P2P hotspot would disconnect the laptop's internet Wi-Fi.
         if not self._manually_disconnected and not peer_disc and self.auto_reconnect_trusted and trusted:
-            if peer.discovery_source == "lan":
+            if peer.discovery_source in ("lan", "ble"):
                 already_same = (
                     peer.is_connected
                     and self.connected_peer is not None
                     and self.connected_peer.device_id == peer.device_id
-                    and self.connected_peer.ip == peer.ip
                 )
                 peer.is_connected = True
                 self.remember_trusted_peer(peer)
@@ -807,11 +946,11 @@ class ConnectP2pWindowsNode:
                     if self.on_connected_peer_change:
                         self.on_connected_peer_change(peer)
                 if not already_same:
-                    self._emit_log(f"[自动重连成功] 已自动恢复与 ★{peer.device_name} ({peer.ip}) 的连接")
+                    self._emit_log(f"[自动重连成功] 已自动恢复与 ★{peer.device_name} ({peer.ip or '蓝牙'}) 的连接")
                     if self.auto_clipboard_sync:
                         clip_txt = get_clipboard_text()
                         if clip_txt:
-                            self.sync_clipboard_text(clip_txt, target_ip=peer.ip, target_peer=peer)
+                            self.sync_clipboard_text(clip_txt, target_peer=peer)
         elif not self._manually_disconnected and not peer_disc and trusted and self.connected_peer and (
             self.connected_peer.device_id == peer.device_id
             or (peer.ip and self.connected_peer.ip == peer.ip)
@@ -910,36 +1049,29 @@ class ConnectP2pWindowsNode:
     def _handle_p2p_wake_request(self, peer: PeerInfo, header: Dict[str, Any]) -> None:
         if self.is_peer_manually_disconnected(peer):
             return
-        self._emit_log(f"[收到定向唤醒请求 ← {peer.device_name}] 原因={header.get('reason')}，正在拉起 Wi-Fi Direct GO...")
-        creds = self.start_p2p_group_on_demand()
+        self._emit_log(f"[收到定向唤醒请求 ← {peer.device_name}] 原因={header.get('reason')}，正在临时开启电脑热点...")
+        creds = self.start_p2p_group_on_demand(persistent=self.hotspot_always_on, announce=False)
+        if not creds.hotspot_on:
+            return
+        ip, ble = self._targets(peer)
+        if not ip and not ble:
+            return
         self.control.send_p2p_group_ready(
             ssid=creds.ssid,
             passphrase=creds.passphrase,
             go_ip=creds.go_ip,
             port=creds.port,
-            target_ip=peer.ip,
+            target_ip=ip,
+            target_ble=ble,
             target_device_id=peer.device_id,
         )
 
     def _handle_p2p_group_ready(self, peer: PeerInfo, header: Dict[str, Any]) -> None:
-        if self.is_peer_manually_disconnected(peer):
-            return
+        # Joining a phone's group would switch the laptop's primary Wi-Fi and drop its internet, so it is
+        # never done automatically; the user can still connect from the GUI ("手动输入SSID连接").
         ssid = str(header.get("ssid", ""))
-        passphrase = str(header.get("passphrase", ""))
         go_ip = str(header.get("go_ip", ANDROID_GO_DEFAULT_IP))
-        port = int(header.get("port", DATA_TCP_PORT))
-        self._emit_log(f"[对端P2P就绪 ← {peer.device_name}] SSID={ssid}, GO={go_ip}:{port}")
-        if ssid and passphrase:
-            threading.Thread(
-                target=self._connect_and_signal_ready,
-                args=(ssid, passphrase, go_ip, port),
-                daemon=True,
-            ).start()
-        else:
-            self._p2p_ready_event.set()
-
-    def _connect_and_signal_ready(self, ssid: str, passphrase: str, go_ip: str, port: int) -> None:
-        self.connect_to_android_p2p_group(ssid=ssid, passphrase=passphrase, go_ip=go_ip, port=port)
+        self._emit_log(f"[对端P2P就绪 ← {peer.device_name}] SSID={ssid}, GO={go_ip}（不自动切换电脑主 Wi-Fi）")
         self._p2p_ready_event.set()
 
     def _handle_remote_p2p_teardown(self, peer: PeerInfo) -> None:
@@ -970,7 +1102,22 @@ class ConnectP2pWindowsNode:
 
     def _handle_idle_teardown(self) -> None:
         creds = self.p2p_controller.active_credentials
-        if creds is None or creds.role != "CLIENT":
+        if creds is None:
+            return
+        if creds.role == "GO":
+            if self._hotspot_wanted:
+                return
+            # On-demand hotspot: stop it once every phone on it is still reachable over BLE.
+            on_hotspot = [
+                p for p in self.control.peers.values()
+                if p.is_connected and p.ip and p.ip.startswith("192.168.137.")
+            ]
+            if all(self.ble.is_linked(p.ble_address) for p in on_hotspot):
+                self.stop_hotspot()
+                self._emit_log("[空闲自动降功耗] 传输已结束，已关闭临时热点（剪贴板与状态继续走低功耗蓝牙）")
+            else:
+                # A phone without BLE depends on the hotspot; check again later.
+                self.watchdog.touch_activity(timeout_sec=60.0)
             return
         has_active_p2p_peer = any(
             p.is_connected and p.ip and p.ip.startswith("192.168.49.")

@@ -95,7 +95,7 @@ class ConnectP2pDesktopApp:
         self.power_label.pack(anchor=tk.W)
 
         self.p2p_info_var = tk.StringVar(
-            value="本机 P2P 热点: 未开启 (可直接扫描连接手机，或开启本机热点让手机一键免密连接)"
+            value="本机热点: 按需开启 (平时走低功耗蓝牙；传文件时自动临时开启，传完自动关闭)"
         )
         ttk.Label(top_frame, textvariable=self.p2p_info_var, font=("Microsoft YaHei UI", 9)).pack(
             anchor=tk.W, pady=(4, 6)
@@ -107,9 +107,16 @@ class ConnectP2pDesktopApp:
         ttk.Button(btn_row, text="🔍 扫描周围设备 (免输SSID)", command=self._on_scan_nearby).pack(
             side=tk.LEFT, padx=(0, 8)
         )
-        ttk.Button(btn_row, text="⚡ 开启本机热点 (让手机发现我)", command=self._on_start_go).pack(
+        ttk.Button(btn_row, text="⚡ 临时开启热点", command=self._on_start_go).pack(
             side=tk.LEFT, padx=(0, 8)
         )
+        self.hotspot_always_on_var = tk.BooleanVar(value=self.node.hotspot_always_on)
+        ttk.Checkbutton(
+            btn_row,
+            text="热点常开 (手机没开蓝牙时用；更快但更耗电)",
+            variable=self.hotspot_always_on_var,
+            command=self._on_toggle_hotspot_always_on,
+        ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="🔌 断开当前连接", command=self._on_disconnect_peer).pack(
             side=tk.LEFT, padx=(0, 8)
         )
@@ -251,13 +258,19 @@ class ConnectP2pDesktopApp:
         ).start()
 
     def _auto_start_go_if_not_connected(self) -> None:
-        if not self.node.p2p_controller.is_active:
-            self._on_start_go()
+        if self.node.hotspot_always_on and not self.node.p2p_controller.is_active:
+            self._on_start_go(persistent=True)
 
-    def _on_start_go(self) -> None:
+    def _on_toggle_hotspot_always_on(self) -> None:
+        enabled = bool(self.hotspot_always_on_var.get())
+        threading.Thread(target=self.node.set_hotspot_always_on, args=(enabled,), daemon=True).start()
+        if not enabled:
+            self.p2p_info_var.set("本机热点: 按需开启 (传文件时自动临时开启，传完自动关闭)")
+
+    def _on_start_go(self, persistent: bool = False) -> None:
         def task() -> None:
             self._ui_queue.put(("p2p_info", "本机热点: 正在开启..."))
-            creds = self.node.start_p2p_group_on_demand()
+            creds = self.node.start_p2p_group_on_demand(persistent=persistent)
             if creds.hotspot_on:
                 msg = f"本机热点: 已开启 {creds.ssid} ({creds.go_ip}) | 电脑主 Wi-Fi 保持连接 | 手机点该电脑即可连接"
             else:
@@ -396,7 +409,7 @@ class ConnectP2pDesktopApp:
                     cp: Optional[PeerInfo] = payload  # type: ignore
                     if cp is not None:
                         self.connected_peer_var.set(
-                            f"🎯 当前指定目标: {cp.device_name} [{cp.platform}] ({cp.ip}) — 定向发文件 & 剪贴板同步中"
+                            f"🎯 当前指定目标: {cp.device_name} [{cp.platform}] ({cp.ip or '蓝牙'}) — 定向发文件 & 剪贴板同步中"
                         )
                         if cp.ip:
                             self.target_ip_var.set(cp.ip)
@@ -421,7 +434,15 @@ class ConnectP2pDesktopApp:
                             state_tag = "[⚪已断开·双击免确认连接]"
                         else:
                             state_tag = "[⚪未连接·双击发起连接请求]"
-                        addr_str = p.p2p_ssid if p.discovery_source == "p2p_scan" else f"{p.ip}:{p.data_port}"
+                        links = []
+                        if p.ip:
+                            links.append(f"{p.ip}:{p.data_port}")
+                        if self.node.ble.is_linked(p.ble_address):
+                            links.append("蓝牙")
+                        if p.discovery_source == "p2p_scan":
+                            addr_str = p.p2p_ssid
+                        else:
+                            addr_str = " + ".join(links) or "离线"
                         self.peer_list.insert(tk.END, f"{icon} {star}{p.device_name} ({addr_str})  {state_tag}")
                 elif kind == "pair_request":
                     req_peer: PeerInfo = payload  # type: ignore
@@ -446,7 +467,7 @@ class ConnectP2pDesktopApp:
             pass
         accepted = messagebox.askyesno(
             "收到陌生设备连接请求",
-            f"陌生设备「{peer.device_name}」({peer.ip}) 请求与本机建立连接并同步剪贴板/传输文件。\n\n"
+            f"陌生设备「{peer.device_name}」({peer.ip or '蓝牙'}) 请求与本机建立连接并同步剪贴板/传输文件。\n\n"
             f"是否同意连接并将其加入 ★已信任设备？",
             parent=self.root,
         )
