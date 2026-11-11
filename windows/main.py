@@ -251,18 +251,18 @@ class ConnectP2pDesktopApp:
         ).start()
 
     def _auto_start_go_if_not_connected(self) -> None:
-        if self.node.connected_peer is None and not self.node.p2p_controller.is_active:
+        if not self.node.p2p_controller.is_active:
             self._on_start_go()
 
     def _on_start_go(self) -> None:
         def task() -> None:
+            self._ui_queue.put(("p2p_info", "本机热点: 正在开启..."))
             creds = self.node.start_p2p_group_on_demand()
-            self._ui_queue.put(
-                (
-                    "p2p_info",
-                    f"本机直连热点已开启: 设备名=\"{self.node.device_name}\" | SSID={creds.ssid} | 手机扫描即可一键免密连接",
-                )
-            )
+            if creds.hotspot_on:
+                msg = f"本机热点: 已开启 {creds.ssid} ({creds.go_ip}) | 电脑主 Wi-Fi 保持连接 | 手机点该电脑即可连接"
+            else:
+                msg = "本机热点: 开启失败 (请检查 Wi-Fi 是否打开，或在系统设置中手动打开一次『移动热点』)"
+            self._ui_queue.put(("p2p_info", msg))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -380,11 +380,8 @@ class ConnectP2pDesktopApp:
                 elif kind == "power":
                     st = payload
                     if st == PowerState.DEEP_IDLE:
-                        self.power_label_var.set(
-                            "● 当前状态: DEEP_IDLE (超低功耗待机 | Wi-Fi P2P 已关闭 | 0 轮询)"
-                        )
+                        self.power_label_var.set("● 当前状态: 待机 (无文件传输)")
                         self.power_label.configure(foreground="#1b7f37")
-                        self.p2p_info_var.set("本机 P2P 热点: 未开启 (非文件传输时自动关闭保续航)")
                     elif st == PowerState.P2P_HANDSHAKE:
                         self.power_label_var.set("◐ 当前状态: P2P_HANDSHAKE (正在按需建立 Wi-Fi P2P 通道...)")
                         self.power_label.configure(foreground="#b58900")

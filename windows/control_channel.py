@@ -78,6 +78,7 @@ class LowPowerControlChannel:
         self.on_pair_request = on_pair_request
         self.on_pair_response = on_pair_response
 
+        self.hotspot_info: Optional[Dict[str, str]] = None
         self._peers: Dict[str, PeerInfo] = {}
         self._peers_lock = threading.Lock()
         self._sock: Optional[socket.socket] = None
@@ -160,17 +161,23 @@ class LowPowerControlChannel:
         """
         Send a single event-driven HELLO packet (no background timer loop!).
         """
-        frame = encode_frame(
-            FrameType.HELLO,
-            {
-                "device_id": self.device_id,
-                "device_name": self.device_name,
-                "platform": self.platform,
-                "data_port": self.data_port,
-                "timestamp": int(time.time() * 1000),
-            },
-        )
+        frame = encode_frame(FrameType.HELLO, self._hello_header(is_reply=False))
         self._send_control_bytes(frame, target_ip=target_ip)
+
+    def _hello_header(self, is_reply: bool) -> Dict[str, Any]:
+        hdr: Dict[str, Any] = {
+            "device_id": self.device_id,
+            "device_name": self.device_name,
+            "platform": self.platform,
+            "data_port": self.data_port,
+            "is_reply": is_reply,
+            "timestamp": int(time.time() * 1000),
+        }
+        if self.hotspot_info:
+            hdr["hotspot_ssid"] = self.hotspot_info.get("ssid", "")
+            hdr["hotspot_passphrase"] = self.hotspot_info.get("passphrase", "")
+            hdr["hotspot_ip"] = self.hotspot_info.get("go_ip", "")
+        return hdr
 
     def send_inline_clipboard(
         self,
@@ -324,7 +331,7 @@ class LowPowerControlChannel:
         if full_frame is not None:
             self._handle_raw_frame(full_frame, sender_ip=sender_address)
 
-    def upsert_discovered_peer(self, peer: PeerInfo) -> None:
+    def upsert_discovered_peer(self, peer: PeerInfo, notify: bool = True) -> None:
         with self._peers_lock:
             existing = self._peers.get(peer.device_id)
             if existing is None:
@@ -341,7 +348,7 @@ class LowPowerControlChannel:
                     existing.p2p_go_ip = peer.p2p_go_ip
                 existing.last_seen = time.time()
                 peer = existing
-        if self.on_peer_discovered:
+        if notify and self.on_peer_discovered:
             self.on_peer_discovered(peer)
 
     def _send_control_bytes(self, frame: bytes, target_ip: Optional[str] = None) -> None:
@@ -468,22 +475,13 @@ class LowPowerControlChannel:
             if peer.p2p_ssid:
                 self._peers.pop(f"p2p-{peer.p2p_ssid}", None)
 
-        if (is_new or changed or not peer.is_connected) and self.on_peer_discovered:
+        # A teardown must not first count as "trusted peer seen" and trigger an auto-reconnect.
+        if ftype != FrameType.P2P_TEARDOWN and (is_new or changed or not peer.is_connected) and self.on_peer_discovered:
             self.on_peer_discovered(peer)
 
         if ftype == FrameType.HELLO:
             if not header.get("is_reply"):
-                reply = encode_frame(
-                    FrameType.HELLO,
-                    {
-                        "device_id": self.device_id,
-                        "device_name": self.device_name,
-                        "platform": self.platform,
-                        "data_port": self.data_port,
-                        "is_reply": True,
-                        "timestamp": int(time.time() * 1000),
-                    },
-                )
+                reply = encode_frame(FrameType.HELLO, self._hello_header(is_reply=True))
                 if sender_ip and "." in sender_ip and self._sock:
                     try:
                         self._sock.sendto(reply, (sender_ip, self.udp_port))

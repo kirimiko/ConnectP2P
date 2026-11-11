@@ -20,6 +20,7 @@ import android.util.Log
 import com.connectp2p.app.ble.BleLowPowerChannel
 import com.connectp2p.app.clipboard.ClipboardSyncActivity
 import com.connectp2p.app.clipboard.ClipboardSyncHelper
+import com.connectp2p.app.p2p.HotspotLinkManager
 import com.connectp2p.app.p2p.P2pTransportEngine
 import com.connectp2p.app.p2p.WifiP2pBurstManager
 import com.connectp2p.app.power.PowerPolicyManager
@@ -47,6 +48,8 @@ class P2pTransferService : Service() {
         private const val PREFS_NAME = "connect_p2p_prefs"
         private const val KEY_DEVICE_NAME = "device_name"
         private const val KEY_TRUSTED_PEERS = "trusted_peers"
+        private const val KEY_PEER_HOTSPOTS = "peer_hotspots"
+        private const val HOTSPOT_RETRY_DELAY_MS = 8_000L
 
         const val ACTION_PUSH_CLIPBOARD_NOW = "com.connectp2p.app.action.PUSH_CLIPBOARD_NOW"
         const val ACTION_DISCONNECT_PEER = "com.connectp2p.app.action.DISCONNECT_PEER"
@@ -82,9 +85,36 @@ class P2pTransferService : Service() {
         private set
     lateinit var clipboardHelper: ClipboardSyncHelper
         private set
+    lateinit var hotspotLink: HotspotLinkManager
+        private set
 
     private val discoveredPeers = ConcurrentHashMap<String, P2pProtocol.PeerInfo>()
     private val trustedPeers = ConcurrentHashMap.newKeySet<String>()
+
+    /** deviceName -> (hotspot SSID, passphrase) for trusted PCs, so they can be reached from any network. */
+    private val peerHotspots = ConcurrentHashMap<String, Pair<String, String>>()
+
+    @Volatile
+    private var lastHotspotAttemptMs: Long = 0L
+
+    @Volatile
+    private var lastHotspotAttemptManual: Boolean = false
+
+    /** SSIDs whose last request was rejected/unavailable; not auto-retried until the user taps connect. */
+    private val hotspotAutoRetryBlocked = ConcurrentHashMap.newKeySet<String>()
+
+    private val livenessMisses = ConcurrentHashMap<String, Int>()
+
+    /**
+     * SSID -> time until which auto-connect is suppressed. Set when the hotspot was up but the PC app did
+     * not answer (crashed/killed app leaves Windows' hotspot running), otherwise the phone would keep
+     * hopping between its own Wi-Fi and a dead hotspot.
+     */
+    private val hotspotSuppressedUntil = ConcurrentHashMap<String, Long>()
+
+    /** (destination IP, clip hash, sent at ms) of the last clipboard push. */
+    @Volatile
+    private var lastClipSend: Triple<String, String, Long>? = null
     private val manuallyDisconnectedPeerIds = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile
@@ -165,36 +195,7 @@ class P2pTransferService : Service() {
                 announcePresenceHello()
             },
             onConnectedToGo = { goIp, isGo ->
-                targetPeerIp = goIp
-                emitLog("[Wi-Fi直连已建立] GO IP=$goIp (${if (isGo) "本机为热点GO" else "已连上对端GO"})")
-                powerPolicy.touchBurstActivity(timeoutMs = 120_000L)
-                announcePresenceHello(targetIp = if (!isGo) goIp else null)
-                if (!isGo) {
-                    val pending = pendingP2pPeer
-                    if (pending != null && !isTrustedPeer(pending)) {
-                        emitLog("[正在请求授权] Wi-Fi直连已接通，正在请求 ${pending.deviceName} ($goIp) 同意连接...")
-                        sendPairRequestFrame(goIp, null, P2pProtocol.DATA_TCP_PORT)
-                    } else {
-                        if (pending != null) {
-                            pending.isConnected = true
-                            pending.lastSeenMs = System.currentTimeMillis()
-                            connectedPeer = pending
-                            updateConnectionNotification()
-                            serviceScope.launch {
-                                uiCallback?.onConnectedPeerChanged(connectedPeer)
-                                uiCallback?.onPeersUpdated(getPeerList())
-                            }
-                        }
-                        sendPairRequestFrame(goIp, pending?.deviceId, P2pProtocol.DATA_TCP_PORT)
-                        android.os.Handler(mainLooper).postDelayed({
-                            clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
-                        }, 400L)
-                    }
-                } else {
-                    android.os.Handler(mainLooper).postDelayed({
-                        clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
-                    }, 400L)
-                }
+                handleLinkEstablished(goIp, isGo)
             },
             onPeersDiscovered = { p2pDevices ->
                 for (dev in p2pDevices) {
@@ -239,14 +240,16 @@ class P2pTransferService : Service() {
                 }
             },
             onDirectHotspotsScanned = { hotspots ->
-                for (hp in hotspots) {
-                    upsertPeer(hp)
-                    if (isTrustedPeer(hp) && !hp.p2pSsid.isNullOrEmpty() && !hp.p2pPassphrase.isNullOrEmpty()) {
-                        wifiP2pManager.registerWifiSuggestionForHotspot(hp.p2pSsid!!, hp.p2pPassphrase!!)
+                for (scanned in hotspots) {
+                    upsertPeer(scanned)
+                    val hp = storedPeerFor(scanned)
+                    val ssid = scanned.p2pSsid ?: continue
+                    val isPcHotspot = scanned.p2pGoIp?.startsWith("192.168.137.") == true
+                    if (isTrustedPeer(hp) && isPcHotspot) {
+                        rememberPeerHotspot(hp.deviceName, ssid, scanned.p2pPassphrase ?: P2pProtocol.deriveP2pPassphrase(ssid))
                     }
-                    if (!isManuallyDisconnected && !isPeerManuallyDisconnected(hp) &&
-                        isTrustedPeer(hp) && wifiP2pManager.canAutoAttemptConnect(hp.p2pSsid)
-                    ) {
+                    val canTry = if (isPcHotspot) canAutoConnectHotspot(ssid) else wifiP2pManager.canAutoAttemptConnect(ssid)
+                    if (!isManuallyDisconnected && !isPeerManuallyDisconnected(hp) && isTrustedPeer(hp) && canTry) {
                         emitLog("[自动重连] 发现已信任热点 ${hp.deviceName} (${hp.p2pSsid})，正在自动免密连接...")
                         connectToPeerAndSync(hp, isManualUserClick = false)
                     }
@@ -318,6 +321,20 @@ class P2pTransferService : Service() {
             }
         )
 
+        hotspotLink = HotspotLinkManager(
+            context = this,
+            onLinkUp = { ssid, gatewayIp ->
+                hotspotAutoRetryBlocked.remove(ssid)
+                emitLog("[电脑热点已接通] $ssid，正在与电脑 $gatewayIp 握手...")
+                handleLinkEstablished(gatewayIp, isGo = false)
+            },
+            onLinkDown = { ssid, wasUp -> handleHotspotLinkDown(ssid, wasUp) },
+            onLogMessage = { emitLog(it) }
+        )
+        transportEngine.networkResolver = { ip -> hotspotLink.networkFor(ip) }
+        wifiP2pManager.removeLegacyNetworkSuggestions()
+        loadPeerHotspots()
+
         powerPolicy.startMonitoringScreenState()
         wifiP2pManager.initialize()
         transportEngine.start()
@@ -328,6 +345,166 @@ class P2pTransferService : Service() {
 
         announcePresenceHello()
         emitLog("[DEEP_IDLE] 服务已就绪 (AES-256 端到端加密已启用 | 接收目录: 内部存储/Download/ConnectP2P)")
+    }
+
+    /**
+     * A Wi-Fi link to the peer exists (phone-to-phone Wi-Fi Direct group, or the PC hotspot). The peer is
+     * only marked connected once it answers (HELLO reply / PAIR_RESPONSE), not when the radio link comes up.
+     */
+    private fun handleLinkEstablished(goIp: String, isGo: Boolean) {
+        emitLog("[Wi-Fi直连已建立] 对端 IP=$goIp (${if (isGo) "本机为热点" else "已连上对端热点"})")
+        powerPolicy.touchBurstActivity(timeoutMs = 120_000L)
+        if (isGo) {
+            announcePresenceHello()
+            return
+        }
+        targetPeerIp = goIp
+        announcePresenceHello(targetIp = goIp)
+        val pending = pendingP2pPeer
+        val awaitingApproval = pending != null && !isTrustedPeer(pending)
+        if (awaitingApproval) {
+            emitLog("[正在请求授权] Wi-Fi直连已接通，正在请求 ${pending!!.deviceName} ($goIp) 同意连接...")
+        }
+        sendPairRequestFrame(goIp, null, P2pProtocol.DATA_TCP_PORT)
+
+        if (hotspotLink.isUp && !awaitingApproval) {
+            serviceScope.launch {
+                delay(10_000L)
+                val anyAnswered = discoveredPeers.values.any { p -> p.isConnected && p.ip?.let { hotspotLink.networkFor(it) } != null }
+                if (hotspotLink.isUp && !anyAnswered) releaseUnresponsiveHotspot()
+            }
+        }
+    }
+
+    private fun releaseUnresponsiveHotspot() {
+        val ssid = hotspotLink.ssid ?: return
+        hotspotSuppressedUntil[ssid] = System.currentTimeMillis() + 5 * 60_000L
+        emitLog("[连接状态更新] 电脑热点在线但电脑端 App 无响应，已断开热点、手机恢复原网络（5 分钟内不自动重连，可手动点『连接』）")
+        hotspotLink.disconnect()
+        transportEngine.releaseNetworkSockets()
+    }
+
+    private fun handleHotspotLinkDown(ssid: String, wasUp: Boolean) {
+        transportEngine.releaseNetworkSockets()
+        var changed = false
+        for (p in discoveredPeers.values) {
+            if (p.isConnected && p.ip?.startsWith("192.168.137.") == true) {
+                p.isConnected = false
+                changed = true
+            }
+        }
+        if (connectedPeer?.ip?.startsWith("192.168.137.") == true) {
+            connectedPeer = discoveredPeers.values.firstOrNull { it.isConnected }
+            connectedPeer?.ip?.let { targetPeerIp = it }
+            changed = true
+        }
+        if (changed) {
+            if (connectedPeer == null) powerPolicy.forceDeepIdleNow()
+            updateConnectionNotification()
+            serviceScope.launch {
+                uiCallback?.onConnectedPeerChanged(connectedPeer)
+                uiCallback?.onPeersUpdated(getPeerList())
+            }
+        }
+        if (!wasUp) {
+            // An automatic attempt can lose the race with the phone re-joining its own Wi-Fi ("scan busy");
+            // retry it once. Manual attempts are not retried: the user may have cancelled the system dialog.
+            if (!lastHotspotAttemptManual && !hotspotAutoRetryBlocked.contains(ssid) && !isManuallyDisconnected) {
+                hotspotAutoRetryBlocked.add(ssid)
+                serviceScope.launch {
+                    delay(5_000L)
+                    val cred = peerHotspots.values.firstOrNull { it.first == ssid } ?: return@launch
+                    if (connectedPeer == null && hotspotLink.state == HotspotLinkManager.State.IDLE && !isManuallyDisconnected) {
+                        emitLog("[自动重连] 再次尝试接入 $ssid...")
+                        connectToPcHotspot(cred.first, cred.second, P2pProtocol.WINDOWS_GO_DEFAULT_IP, isManualUserClick = false)
+                    }
+                }
+            } else {
+                hotspotAutoRetryBlocked.add(ssid)
+            }
+        } else if (!isManuallyDisconnected) {
+            serviceScope.launch {
+                delay(HOTSPOT_RETRY_DELAY_MS)
+                tryAutoConnectTrustedHotspot()
+            }
+        }
+    }
+
+    /**
+     * @param visibleInScan the SSID was just seen in a Wi-Fi scan, so an earlier "unavailable" result is stale.
+     */
+    private fun canAutoConnectHotspot(ssid: String, visibleInScan: Boolean = true): Boolean {
+        if (hotspotLink.state != HotspotLinkManager.State.IDLE) return false
+        if (connectedPeer != null) return false
+        if (System.currentTimeMillis() < (hotspotSuppressedUntil[ssid] ?: 0L)) return false
+        val cooldown = if (visibleInScan) 30_000L else 15_000L
+        if (System.currentTimeMillis() - lastHotspotAttemptMs < cooldown) return false
+        if (!visibleInScan && hotspotAutoRetryBlocked.contains(ssid)) return false
+        return true
+    }
+
+    /** Only effective while the app is in the foreground: Android ignores specifier requests from background apps. */
+    private fun tryAutoConnectTrustedHotspot() {
+        if (isManuallyDisconnected || connectedPeer != null) return
+        for ((name, cred) in peerHotspots) {
+            if (manuallyDisconnectedPeerIds.contains("name:$name")) continue
+            if (!canAutoConnectHotspot(cred.first, visibleInScan = false)) continue
+            emitLog("[自动重连] 正在接入已信任电脑 $name 的热点 ${cred.first}...")
+            pendingP2pPeer = discoveredPeers.values.firstOrNull { it.deviceName == name }
+            connectToPcHotspot(cred.first, cred.second, P2pProtocol.WINDOWS_GO_DEFAULT_IP, isManualUserClick = false)
+            return
+        }
+    }
+
+    private fun connectToPcHotspot(ssid: String, passphrase: String, gatewayIp: String, isManualUserClick: Boolean) {
+        if (isManualUserClick) {
+            hotspotAutoRetryBlocked.remove(ssid)
+            hotspotSuppressedUntil.remove(ssid)
+        }
+        lastHotspotAttemptManual = isManualUserClick
+        lastHotspotAttemptMs = System.currentTimeMillis()
+        isManuallyDisconnected = false
+        powerPolicy.onHandshakeStarted(handshakeTimeoutMs = 120_000L)
+        if (!hotspotLink.isUp && wifiP2pManager.isSubnetAlreadyReachable(gatewayIp)) {
+            handleLinkEstablished(gatewayIp, isGo = false)
+            return
+        }
+        hotspotLink.connect(ssid, passphrase, gatewayIp)
+    }
+
+    private fun rememberPeerHotspot(name: String, ssid: String, passphrase: String) {
+        if (name.isBlank() || !ssid.startsWith("DIRECT-CP-")) return
+        if (peerHotspots[name] == Pair(ssid, passphrase)) return
+        peerHotspots[name] = Pair(ssid, passphrase)
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet(KEY_PEER_HOTSPOTS, peerHotspots.map { (n, c) -> "$n\t${c.first}\t${c.second}" }.toSet())
+            .apply()
+    }
+
+    /** Restores trusted PCs' hotspots and lists them, so they can be connected even when not currently discovered. */
+    private fun loadPeerHotspots() {
+        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getStringSet(KEY_PEER_HOTSPOTS, emptySet()) ?: emptySet()
+        for (entry in raw) {
+            val parts = entry.split("\t")
+            if (parts.size != 3) continue
+            val (name, ssid, pass) = parts
+            if (!trustedPeers.contains("name:$name")) continue
+            peerHotspots[name] = Pair(ssid, pass)
+            if (discoveredPeers.values.none { it.deviceName == name }) {
+                discoveredPeers["p2p-$ssid"] = P2pProtocol.PeerInfo(
+                    deviceId = "p2p-$ssid",
+                    deviceName = name,
+                    platform = "windows",
+                    ip = P2pProtocol.WINDOWS_GO_DEFAULT_IP,
+                    p2pSsid = ssid,
+                    p2pPassphrase = pass,
+                    p2pGoIp = P2pProtocol.WINDOWS_GO_DEFAULT_IP,
+                    discoverySource = "p2p_scan",
+                    lastSeenMs = 0L
+                )
+            }
+        }
     }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -391,7 +568,12 @@ class P2pTransferService : Service() {
             val alive = transportEngine.probePeerAlive(ip, peer.dataPort, timeoutMs = 1500)
             if (alive) {
                 peer.lastSeenMs = System.currentTimeMillis()
+                livenessMisses.remove(peer.deviceId)
             } else {
+                val misses = (livenessMisses[peer.deviceId] ?: 0) + 1
+                livenessMisses[peer.deviceId] = misses
+                if (!forceProbe && misses < 2) continue
+                livenessMisses.remove(peer.deviceId)
                 peer.isConnected = false
                 statusChanged = true
                 emitLog("[连接状态更新] 检测到与 ${peer.deviceName} ($ip) 的连接已断开/离线")
@@ -404,6 +586,10 @@ class P2pTransferService : Service() {
         if (statusChanged) {
             if (connectedPeer == null) {
                 powerPolicy.forceDeepIdleNow()
+            }
+            // PC app gone but its hotspot still up (crash/kill): don't keep the phone parked off its own Wi-Fi.
+            if (hotspotLink.isUp && discoveredPeers.values.none { it.isConnected && it.ip?.let { ip -> hotspotLink.networkFor(ip) } != null }) {
+                releaseUnresponsiveHotspot()
             }
             updateConnectionNotification()
             serviceScope.launch(Dispatchers.Main) {
@@ -460,6 +646,8 @@ class P2pTransferService : Service() {
         unregisterNetworkCallback()
         clipboardHelper.stop()
         bleChannel.stopLowPowerChannel()
+        hotspotLink.disconnect()
+        transportEngine.releaseNetworkSockets()
         transportEngine.stop()
         wifiP2pManager.shutdown()
         powerPolicy.stopMonitoringScreenState()
@@ -522,6 +710,11 @@ class P2pTransferService : Service() {
             verifyConnectedPeersLiveness(forceProbe = true)
         }
         uiCallback?.onPeersUpdated(getPeerList())
+        // Give LAN discovery a moment; if no trusted peer answered, reach a trusted PC through its hotspot.
+        serviceScope.launch {
+            delay(2_500L)
+            tryAutoConnectTrustedHotspot()
+        }
     }
 
     fun isTrustedPeer(peer: P2pProtocol.PeerInfo): Boolean {
@@ -588,6 +781,7 @@ class P2pTransferService : Service() {
         manuallyDisconnectedPeerIds.remove(peer.deviceId)
         if (peer.deviceName.isNotBlank()) {
             manuallyDisconnectedPeerIds.remove("name:${peer.deviceName}")
+            discoveredPeers.values.filter { it.deviceName == peer.deviceName }.forEach { manuallyDisconnectedPeerIds.remove(it.deviceId) }
         }
 
         when {
@@ -597,14 +791,6 @@ class P2pTransferService : Service() {
                 val pass = peer.p2pPassphrase ?: P2pProtocol.deriveP2pPassphrase(ssid)
                 val goIp = peer.p2pGoIp ?: peer.ip ?: P2pProtocol.WINDOWS_GO_DEFAULT_IP
                 emitLog("[一键免密直连] 正在连接 ${peer.deviceName} ($ssid)...")
-                if (isTrustedPeer(peer) && wifiP2pManager.isSubnetAlreadyReachable(goIp)) {
-                    peer.isConnected = true
-                    peer.lastSeenMs = System.currentTimeMillis()
-                    connectedPeer = peer
-                    updateConnectionNotification()
-                    uiCallback?.onConnectedPeerChanged(peer)
-                    uiCallback?.onPeersUpdated(getPeerList())
-                }
                 connectToPeerBurstGroup(ssid, pass, goIp, isManualUserClick = isManualUserClick)
             }
             peer.discoverySource == "p2p_peer" && !peer.p2pDeviceAddress.isNullOrEmpty() -> {
@@ -628,18 +814,41 @@ class P2pTransferService : Service() {
                     requestPairing(peer)
                     return
                 }
-                peer.isConnected = true
-                rememberTrustedPeer(peer)
-                connectedPeer = peer
-                updateConnectionNotification()
-                uiCallback?.onConnectedPeerChanged(peer)
-                uiCallback?.onPeersUpdated(getPeerList())
-                sendPairRequestFrame(ip, peer.deviceId, peer.dataPort)
-                emitLog("[已连接信任设备] ★${peer.deviceName} ($ip) -> 正在定向同步剪贴板")
-                announcePresenceHello(targetIp = ip)
-                clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
+                emitLog("[正在连接] ★${peer.deviceName} ($ip)...")
+                serviceScope.launch {
+                    if (transportEngine.probePeerAlive(ip, peer.dataPort, timeoutMs = 1500)) {
+                        markPeerConnected(peer, ip)
+                        sendPairRequestFrame(ip, peer.deviceId, peer.dataPort)
+                        announcePresenceHello(targetIp = ip)
+                        return@launch
+                    }
+                    val hotspot = peerHotspots[peer.deviceName]
+                        ?: peer.p2pSsid?.takeIf { it.startsWith("DIRECT-CP-") }?.let {
+                            Pair(it, peer.p2pPassphrase ?: P2pProtocol.deriveP2pPassphrase(it))
+                        }
+                    if (hotspot != null) {
+                        emitLog("[正在连接] ${peer.deviceName} 在当前网络不可达，改为接入其热点 ${hotspot.first}...")
+                        pendingP2pPeer = peer
+                        connectToPcHotspot(hotspot.first, hotspot.second, peer.p2pGoIp ?: P2pProtocol.WINDOWS_GO_DEFAULT_IP, isManualUserClick)
+                    } else {
+                        emitLog("[连接失败] ${peer.deviceName} ($ip) 无响应：请确认对方 App 已打开且双方在同一网络，或在电脑端开启热点")
+                    }
+                }
             }
         }
+    }
+
+    private fun markPeerConnected(peer: P2pProtocol.PeerInfo, ip: String) {
+        peer.isConnected = true
+        peer.ip = ip
+        peer.lastSeenMs = System.currentTimeMillis()
+        rememberTrustedPeer(peer)
+        connectedPeer = peer
+        targetPeerIp = ip
+        updateConnectionNotification()
+        uiCallback?.onConnectedPeerChanged(peer)
+        uiCallback?.onPeersUpdated(getPeerList())
+        emitLog("[已连接] ★${peer.deviceName} ($ip)")
     }
 
     /**
@@ -712,7 +921,6 @@ class P2pTransferService : Service() {
                 uiCallback?.onPeersUpdated(getPeerList())
             }
             emitLog("[已同意连接] 已同意 \"${peer.deviceName}\" ($destIp) 的连接请求并加入 ★已信任设备")
-            clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
         } else {
             peer.isConnected = false
             serviceScope.launch {
@@ -747,11 +955,19 @@ class P2pTransferService : Service() {
             connectedPeer?.ip?.let { targetPeerIp = it }
         }
 
-        // If no peers remain connected, tear down P2P hotspot and return to DEEP_IDLE
+        val wasOnPcHotspot = peer.ip?.startsWith("192.168.137.") == true
         if (connectedPeer == null) {
             isManuallyDisconnected = true
             wifiP2pManager.teardownGroup()
             powerPolicy.forceDeepIdleNow()
+        }
+        if (wasOnPcHotspot && discoveredPeers.values.none { it.isConnected && it.ip?.startsWith("192.168.137.") == true }) {
+            // Let the teardown frame leave over the hotspot before releasing the network.
+            serviceScope.launch {
+                delay(600L)
+                hotspotLink.disconnect()
+                transportEngine.releaseNetworkSockets()
+            }
         }
 
         updateConnectionNotification()
@@ -783,6 +999,11 @@ class P2pTransferService : Service() {
         sendP2pTeardownSignal()
         wifiP2pManager.teardownGroup()
         powerPolicy.forceDeepIdleNow()
+        serviceScope.launch {
+            delay(600L)
+            hotspotLink.disconnect()
+            transportEngine.releaseNetworkSockets()
+        }
         emitLog("[已手动断开连接] 当前连接已断开，Wi-Fi P2P 已关闭回到低功耗待机")
     }
 
@@ -800,6 +1021,10 @@ class P2pTransferService : Service() {
      * using SSID + Passphrase with zero WPS dialogs.
      */
     fun connectToPeerBurstGroup(ssid: String, passphrase: String, goIp: String, isManualUserClick: Boolean = true) {
+        if (goIp.startsWith("192.168.137.")) {
+            connectToPcHotspot(ssid, passphrase, goIp, isManualUserClick)
+            return
+        }
         isManuallyDisconnected = false
         powerPolicy.onHandshakeStarted(handshakeTimeoutMs = 120_000L)
         targetPeerIp = goIp
@@ -829,7 +1054,11 @@ class P2pTransferService : Service() {
             transportEngine.sendControlFrameTcp(frame, targetIp, P2pProtocol.DATA_TCP_PORT)
         } else {
             transportEngine.broadcastControlFrameUdp(frame, extraTargetIp = targetPeerIp)
-            if (wifiP2pManager.isSubnetAlreadyReachable(P2pProtocol.WINDOWS_GO_DEFAULT_IP)) {
+            val pcGateway = if (hotspotLink.isUp) hotspotLink.gatewayIp else null
+            if (pcGateway != null) {
+                transportEngine.sendControlFrameUdp(frame, pcGateway)
+                transportEngine.sendControlFrameTcp(frame, pcGateway, P2pProtocol.DATA_TCP_PORT)
+            } else if (wifiP2pManager.isSubnetAlreadyReachable(P2pProtocol.WINDOWS_GO_DEFAULT_IP)) {
                 transportEngine.sendControlFrameTcp(frame, P2pProtocol.WINDOWS_GO_DEFAULT_IP, P2pProtocol.DATA_TCP_PORT)
             }
             if (wifiP2pManager.isSubnetAlreadyReachable(P2pProtocol.ANDROID_GO_DEFAULT_IP)) {
@@ -838,7 +1067,25 @@ class P2pTransferService : Service() {
         }
     }
 
+    /** A scan/Wi-Fi Direct placeholder for a device that already answered is folded into the real entry. */
+    private fun storedPeerFor(peer: P2pProtocol.PeerInfo): P2pProtocol.PeerInfo =
+        discoveredPeers[peer.deviceId]
+            ?: if (peer.deviceId.startsWith("p2p")) {
+                discoveredPeers.values.firstOrNull { !it.deviceId.startsWith("p2p") && it.deviceName == peer.deviceName } ?: peer
+            } else {
+                peer
+            }
+
     private fun upsertPeer(peer: P2pProtocol.PeerInfo): Boolean {
+        if (peer.deviceId.startsWith("p2p")) {
+            val real = storedPeerFor(peer)
+            if (real !== peer && !real.deviceId.startsWith("p2p")) {
+                if (!peer.p2pSsid.isNullOrBlank()) real.p2pSsid = peer.p2pSsid
+                if (!peer.p2pPassphrase.isNullOrBlank()) real.p2pPassphrase = peer.p2pPassphrase
+                if (!peer.p2pGoIp.isNullOrBlank()) real.p2pGoIp = peer.p2pGoIp
+                return false
+            }
+        }
         val existing = discoveredPeers[peer.deviceId]
         val isNewOrChanged: Boolean
         if (existing != null) {
@@ -854,18 +1101,20 @@ class P2pTransferService : Service() {
             isNewOrChanged = true
             discoveredPeers[peer.deviceId] = peer
         }
-        // Clean up duplicate scan / P2P placeholders if real device ID was discovered
-        peer.p2pSsid?.let { ssid ->
-            if (peer.deviceId != "p2p-$ssid") {
-                discoveredPeers.remove("p2p-$ssid")
-            }
-        }
-        if (!peer.deviceId.startsWith("p2p") && peer.ip == P2pProtocol.WINDOWS_GO_DEFAULT_IP) {
+        // Once the real device answered, drop scan/Wi-Fi Direct placeholders that describe the same device.
+        if (!peer.deviceId.startsWith("p2p")) {
+            val real = discoveredPeers[peer.deviceId] ?: peer
             val staleIds = discoveredPeers.values
-                .filter { it.deviceId.startsWith("p2p") && it.ip == P2pProtocol.WINDOWS_GO_DEFAULT_IP }
+                .filter {
+                    it.deviceId.startsWith("p2p") &&
+                        (it.deviceName == real.deviceName || (real.p2pSsid != null && it.p2pSsid == real.p2pSsid))
+                }
                 .map { it.deviceId }
             for (sid in staleIds) {
-                discoveredPeers.remove(sid)
+                val removed = discoveredPeers.remove(sid)
+                if (removed != null && connectedPeer?.deviceId == sid) {
+                    connectedPeer = real
+                }
             }
         }
         serviceScope.launch {
@@ -873,6 +1122,10 @@ class P2pTransferService : Service() {
         }
         return isNewOrChanged
     }
+
+    /** Placeholder entries (`p2p-<ssid>`, `p2pdev-<mac>`) are not IDs the peer recognizes as its own. */
+    private fun realDeviceId(peer: P2pProtocol.PeerInfo?): String? =
+        peer?.deviceId?.takeIf { !it.startsWith("p2p") }
 
     /**
      * Smart Clipboard Sync (Unicast to the specified/connected target device ONLY — never broadcast!):
@@ -891,6 +1144,14 @@ class P2pTransferService : Service() {
         val payload = text.toByteArray(StandardCharsets.UTF_8)
         val digest = clipHash ?: P2pProtocol.computeClipHash(payload)
 
+        // Connect handshakes arrive over both UDP and TCP and each one triggers a sync; send a clip once.
+        val now = System.currentTimeMillis()
+        val last = lastClipSend
+        if (last != null && last.first == destIp && last.second == digest && now - last.third < 3_000L) {
+            return
+        }
+        lastClipSend = Triple(destIp, digest, now)
+
         if (payload.size <= P2pProtocol.MAX_INLINE_CLIPBOARD_BYTES) {
             val header = JSONObject().apply {
                 put("device_id", deviceId)
@@ -899,11 +1160,12 @@ class P2pTransferService : Service() {
                 put("mime", "text/plain")
                 put("timestamp", System.currentTimeMillis())
                 put("origin_device_id", deviceId)
-                destPeer?.deviceId?.let { put("target_device_id", it) }
+                realDeviceId(destPeer)?.let { put("target_device_id", it) }
             }
             val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.CLIPBOARD_SYNC, header, payload)
-            // Unicast ONLY to the target peer's IP (no subnet broadcast!)
+            // UDP for latency, TCP for delivery; the receiver de-duplicates by clip hash.
             transportEngine.sendControlFrameUdp(frame, destIp)
+            transportEngine.sendControlFrameTcp(frame, destIp, destPeer?.dataPort ?: P2pProtocol.DATA_TCP_PORT)
             val preview = text.replace("\r", " ").replace("\n", " ").take(36)
             emitLog("[已发送剪贴板 → $destName] \"$preview\" (${payload.size} B)")
         } else {
@@ -948,7 +1210,7 @@ class P2pTransferService : Service() {
             put("device_name", deviceName)
             put("platform", "android")
             put("reason", "file_transfer")
-            targetDeviceId?.let { put("target_device_id", it) }
+            targetDeviceId?.takeIf { !it.startsWith("p2p") }?.let { put("target_device_id", it) }
             put("timestamp", System.currentTimeMillis())
         }
         val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.P2P_WAKE_REQUEST, header)
@@ -966,7 +1228,7 @@ class P2pTransferService : Service() {
             put("passphrase", passphrase)
             put("go_ip", goIp)
             put("port", P2pProtocol.DATA_TCP_PORT)
-            connectedPeer?.deviceId?.let { put("target_device_id", it) }
+            realDeviceId(connectedPeer)?.let { put("target_device_id", it) }
             put("timestamp", System.currentTimeMillis())
         }
         val frame = P2pProtocol.encodeFrame(P2pProtocol.FrameType.P2P_GROUP_READY, header)
@@ -1013,19 +1275,26 @@ class P2pTransferService : Service() {
             platform = remotePlatform,
             ip = ipAddr,
             dataPort = remotePort,
-            p2pSsid = frame.header.optString("ssid", "").takeIf { it.isNotEmpty() },
-            p2pPassphrase = frame.header.optString("passphrase", "").takeIf { it.isNotEmpty() },
-            p2pGoIp = frame.header.optString("go_ip", "").takeIf { it.isNotEmpty() },
+            p2pSsid = (frame.header.optString("hotspot_ssid", "").ifEmpty { frame.header.optString("ssid", "") }).takeIf { it.isNotEmpty() },
+            p2pPassphrase = (frame.header.optString("hotspot_passphrase", "").ifEmpty { frame.header.optString("passphrase", "") }).takeIf { it.isNotEmpty() },
+            p2pGoIp = (frame.header.optString("hotspot_ip", "").ifEmpty { frame.header.optString("go_ip", "") }).takeIf { it.isNotEmpty() },
             discoverySource = if (ipAddr != null) "lan" else "ble"
         )
         val isNewOrChanged = upsertPeer(peer)
         val storedPeer = discoveredPeers[remoteId] ?: peer
         val trusted = isTrustedPeer(storedPeer)
         val peerManuallyDisconnected = isPeerManuallyDisconnected(storedPeer)
+        val wasConnectedBefore = storedPeer.isConnected
+
+        val hotspotSsid = frame.header.optString("hotspot_ssid", "")
+        if (trusted && hotspotSsid.isNotEmpty()) {
+            rememberPeerHotspot(remoteName, hotspotSsid, frame.header.optString("hotspot_passphrase", P2pProtocol.deriveP2pPassphrase(hotspotSsid)))
+        }
 
         // ONLY auto-connect if the peer is ALREADY a trusted (`★已信任`) device!
         // Stranger devices must NEVER auto-connect without manual user approval.
-        if (!isManuallyDisconnected && !peerManuallyDisconnected && trusted && ipAddr != null) {
+        val isTeardown = frame.type == P2pProtocol.FrameType.P2P_TEARDOWN
+        if (!isTeardown && !isManuallyDisconnected && !peerManuallyDisconnected && trusted && ipAddr != null) {
             val wasConnected = storedPeer.isConnected && (connectedPeer?.deviceId == remoteId)
             storedPeer.isConnected = true
             rememberTrustedPeer(storedPeer)
@@ -1041,7 +1310,7 @@ class P2pTransferService : Service() {
             if (!wasConnected) {
                 emitLog("[自动重连成功] 已自动恢复与 ★$remoteName ($ipAddr) 的连接")
             }
-        } else if (!peerManuallyDisconnected && trusted && (connectedPeer?.deviceId == remoteId || (ipAddr != null && connectedPeer?.ip == ipAddr))) {
+        } else if (!isTeardown && !peerManuallyDisconnected && trusted && (connectedPeer?.deviceId == remoteId || (ipAddr != null && connectedPeer?.ip == ipAddr))) {
             storedPeer.isConnected = true
             connectedPeer = storedPeer
             if (ipAddr != null) targetPeerIp = ipAddr
@@ -1093,8 +1362,11 @@ class P2pTransferService : Service() {
                         uiCallback?.onConnectedPeerChanged(connectedPeer)
                         uiCallback?.onPeersUpdated(getPeerList())
                     }
-                    emitLog("[对方已同意连接] \"$remoteName\" (${ipAddr ?: senderAddr}) 已同意连接请求！已加入 ★已信任设备 并同步剪贴板")
-                    clipboardHelper.inspectAndNotifyIfChanged(forceNotify = true)
+                    // Connecting never pushes this phone's clipboard: the peer pushes its own on connect, and
+                    // pushing both ways at once makes the two clipboards swap.
+                    if (!wasConnectedBefore) {
+                        emitLog("[对方已同意连接] \"$remoteName\" (${ipAddr ?: senderAddr}) 已同意连接请求！已加入 ★已信任设备")
+                    }
                 } else {
                     storedPeer.isConnected = false
                     serviceScope.launch {
@@ -1145,6 +1417,12 @@ class P2pTransferService : Service() {
                 if (connectedPeer == null) {
                     wifiP2pManager.teardownGroup()
                     powerPolicy.forceDeepIdleNow()
+                }
+                if (ipAddr != null && hotspotLink.networkFor(ipAddr) != null &&
+                    discoveredPeers.values.none { it.isConnected && it.ip?.let { ip -> hotspotLink.networkFor(ip) } != null }
+                ) {
+                    hotspotLink.disconnect()
+                    transportEngine.releaseNetworkSockets()
                 }
                 updateConnectionNotification()
                 serviceScope.launch {

@@ -1,5 +1,6 @@
 package com.connectp2p.app.p2p
 
+import android.net.Network
 import android.util.Log
 import com.connectp2p.app.power.PowerPolicyManager
 import com.connectp2p.app.protocol.P2pProtocol
@@ -54,6 +55,55 @@ class P2pTransportEngine(
     private var tcpServer: ServerSocket? = null
     private var udpSocket: DatagramSocket? = null
 
+    /**
+     * Resolves destinations that live on a non-default network (the PC hotspot joined via
+     * WifiNetworkSpecifier). Sockets to those IPs must be bound to that network explicitly,
+     * otherwise they follow the default network (phone's own Wi-Fi / VPN) and never arrive.
+     */
+    @Volatile
+    var networkResolver: (String) -> Network? = { null }
+
+    private val boundUdpSockets = HashMap<Network, DatagramSocket>()
+
+    private fun newTcpSocket(targetIp: String): Socket {
+        val sock = Socket()
+        networkResolver(targetIp)?.let { net ->
+            try {
+                net.bindSocket(sock)
+            } catch (e: Exception) {
+                Log.w(TAG, "bindSocket(tcp) to $net failed: ${e.message}")
+            }
+        }
+        return sock
+    }
+
+    private fun udpSenderFor(targetIp: String): DatagramSocket? {
+        val net = networkResolver(targetIp) ?: return udpSocket ?: try {
+            DatagramSocket().apply { broadcast = true }
+        } catch (_: Exception) {
+            null
+        }
+        synchronized(boundUdpSockets) {
+            boundUdpSockets[net]?.takeIf { !it.isClosed }?.let { return it }
+            return try {
+                DatagramSocket().apply {
+                    broadcast = true
+                    net.bindSocket(this)
+                }.also { boundUdpSockets[net] = it }
+            } catch (e: Exception) {
+                Log.w(TAG, "bindSocket(udp) to $net failed: ${e.message}")
+                udpSocket
+            }
+        }
+    }
+
+    fun releaseNetworkSockets() {
+        synchronized(boundUdpSockets) {
+            boundUdpSockets.values.forEach { runCatching { it.close() } }
+            boundUdpSockets.clear()
+        }
+    }
+
     @Volatile
     private var running = false
 
@@ -81,8 +131,7 @@ class P2pTransportEngine(
     fun sendControlFrameUdp(frameBytes: ByteArray, targetIp: String = "255.255.255.255") {
         scope.launch {
             try {
-                val sock = udpSocket ?: DatagramSocket()
-                sock.broadcast = true
+                val sock = udpSenderFor(targetIp) ?: return@launch
                 val addr = InetAddress.getByName(targetIp)
                 val packet = DatagramPacket(frameBytes, frameBytes.size, addr, P2pProtocol.CONTROL_UDP_PORT)
                 sock.send(packet)
@@ -95,7 +144,7 @@ class P2pTransportEngine(
     fun sendControlFrameTcp(frameBytes: ByteArray, targetIp: String, port: Int = P2pProtocol.DATA_TCP_PORT) {
         scope.launch {
             try {
-                Socket().use { sock ->
+                newTcpSocket(targetIp).use { sock ->
                     sock.tcpNoDelay = true
                     sock.connect(InetSocketAddress(targetIp, port), 1500)
                     sock.getOutputStream().write(frameBytes)
@@ -113,7 +162,7 @@ class P2pTransportEngine(
         timeoutMs: Int = 1500
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            Socket().use { sock ->
+            newTcpSocket(targetIp).use { sock ->
                 sock.tcpNoDelay = true
                 sock.soTimeout = timeoutMs
                 sock.connect(InetSocketAddress(targetIp, port), timeoutMs)
@@ -162,14 +211,9 @@ class P2pTransportEngine(
             } catch (_: Throwable) {
             }
 
-            val sock = udpSocket ?: try {
-                DatagramSocket().apply { broadcast = true }
-            } catch (_: Throwable) {
-                return@launch
-            }
-
             for (ip in targets) {
                 try {
+                    val sock = udpSenderFor(ip) ?: continue
                     val addr = InetAddress.getByName(ip)
                     val packet = DatagramPacket(frameBytes, frameBytes.size, addr, P2pProtocol.CONTROL_UDP_PORT)
                     sock.send(packet)
@@ -185,7 +229,7 @@ class P2pTransportEngine(
             val clipHash = P2pProtocol.computeClipHash(payload)
             powerPolicy.onTransferStarted()
             try {
-                Socket().use { sock ->
+                newTcpSocket(targetIp).use { sock ->
                     sock.tcpNoDelay = true
                     sock.connect(InetSocketAddress(targetIp, port), 6000)
                     val header = JSONObject().apply {
@@ -222,7 +266,7 @@ class P2pTransportEngine(
 
         powerPolicy.onTransferStarted()
         try {
-            Socket().use { sock ->
+            newTcpSocket(targetIp).use { sock ->
                 sock.sendBufferSize = P2pProtocol.SOCKET_BUFFER_SIZE
                 sock.tcpNoDelay = true
                 sock.soTimeout = 20_000

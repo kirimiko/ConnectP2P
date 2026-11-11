@@ -72,6 +72,12 @@ class ConnectP2pEndToEndTest(unittest.TestCase):
         self.assertEqual(decoded_payload, payload)
 
     def test_02_clipboard_loop_suppression(self) -> None:
+        from clipboard_win32 import get_clipboard_text, set_clipboard_text
+
+        original_clip = get_clipboard_text()
+        if original_clip is not None:
+            self.addCleanup(set_clipboard_text, original_clip)
+
         triggered = []
         ctrl = ClipboardSyncController(on_local_clipboard_change=lambda txt, h: triggered.append((txt, h)))
 

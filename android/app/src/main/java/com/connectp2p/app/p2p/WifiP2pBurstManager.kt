@@ -5,13 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.wifi.WifiManager
-import android.net.wifi.WifiNetworkSpecifier
-import android.net.wifi.WifiNetworkSuggestion
 import android.net.wifi.WpsInfo
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
@@ -19,7 +13,6 @@ import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
-import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import com.connectp2p.app.protocol.P2pProtocol
@@ -45,12 +38,8 @@ class WifiP2pBurstManager(
         context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
     private val wifiManager: WifiManager? =
         context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-    private val connectivityManager: ConnectivityManager? =
-        context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-    private val mainHandler = Handler(Looper.getMainLooper())
     private var channel: WifiP2pManager.Channel? = null
     private var isReceiverRegistered = false
-    private var activeSpecifierCallback: ConnectivityManager.NetworkCallback? = null
 
     @Volatile
     var activeGroupSsid: String? = null
@@ -251,41 +240,26 @@ class WifiP2pBurstManager(
         return false
     }
 
-    fun registerWifiSuggestionForHotspot(ssid: String, passphrase: String) {
+    /**
+     * Remove Wi-Fi suggestions registered by older builds: a high-priority suggestion for the PC hotspot
+     * could make the phone's primary Wi-Fi roam onto the PC and lose internet.
+     */
+    fun removeLegacyNetworkSuggestions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
-                val suggestion = WifiNetworkSuggestion.Builder()
-                    .setSsid(ssid)
-                    .setWpa2Passphrase(passphrase)
-                    .setIsAppInteractionRequired(false)
-                    .setPriority(1000)
-                    .build()
-                wifiManager?.addNetworkSuggestions(listOf(suggestion))
+                wifiManager?.removeNetworkSuggestions(emptyList())
             } catch (_: Throwable) {
             }
         }
     }
 
     /**
-     * Connect directly to a peer's Autonomous Wi-Fi P2P Group or Windows Hotspot (`DIRECT-CP-*`)
-     * using SSID + Passphrase.
+     * Connect to another Android phone's Wi-Fi Direct group (`DIRECT-CP-*`, GO at 192.168.49.1) by SSID +
+     * passphrase. Windows hotspots are plain SoftAPs and are handled by [HotspotLinkManager] instead.
      */
     fun connectWithCredentials(ssid: String, passphrase: String, expectedGoIp: String, isManualUserClick: Boolean = false) {
         val normalizedSsid = if (ssid.startsWith("DIRECT-")) ssid else "DIRECT-CP-N-${ssid.take(20)}"
         val validPass = if (passphrase.length in 8..63) passphrase else P2pProtocol.deriveP2pPassphrase(normalizedSsid)
-
-        // 1. If our Wi-Fi / P2P interface is ALREADY in the target hotspot's subnet (e.g., 192.168.137.x),
-        //    do NOT re-initiate P2P group formation (which would fail on p2p0 against a Windows SoftAP)!
-        if (isSubnetAlreadyReachable(expectedGoIp)) {
-            Log.i(TAG, "Already in hotspot subnet for $normalizedSsid ($expectedGoIp) -> connecting directly")
-            currentGoIp = expectedGoIp
-            isConnectingOrConnected = true
-            lastFailedSsid = null
-            lastConnectAttemptTimeMs = System.currentTimeMillis()
-            onLogMessage("[直连就绪] 本机已接入热点子网 ($expectedGoIp)，正在建立加密通信...")
-            onConnectedToGo(expectedGoIp, false)
-            return
-        }
 
         val now = System.currentTimeMillis()
         if (!isManualUserClick && (isConnectingOrConnected || now - lastConnectAttemptTimeMs < CONNECT_COOLDOWN_MS)) {
@@ -304,14 +278,6 @@ class WifiP2pBurstManager(
             }
         }
 
-        // 2. If connecting to a Windows Mobile Hotspot (`192.168.137.1`), connect via standard WLAN (wlan0)
-        //    because Windows `NetworkOperatorTetheringManager` is a standard WPA2 SoftAP, not a P2P Group Owner.
-        if (expectedGoIp == P2pProtocol.WINDOWS_GO_DEFAULT_IP) {
-            connectToWindowsSoftAp(normalizedSsid, validPass, expectedGoIp, isManualUserClick)
-            return
-        }
-
-        // 3. For Android-to-Android Wi-Fi Direct GO (`192.168.49.1`), connect via WifiP2pManager (p2p0)
         if (mgr == null || ch == null) {
             isConnectingOrConnected = false
             return
@@ -352,131 +318,6 @@ class WifiP2pBurstManager(
             isConnectingOrConnected = false
             Log.e(TAG, "connectWithCredentials failed: ${t.message}")
             onLogMessage("[直连异常] ${t.message}")
-        }
-    }
-
-    private fun connectToWindowsSoftAp(
-        ssid: String,
-        passphrase: String,
-        expectedGoIp: String,
-        isManualUserClick: Boolean
-    ) {
-        currentGoIp = expectedGoIp
-        onLogMessage("[正在直连电脑热点] 正在自动接入 $ssid ($expectedGoIp)...")
-
-        // Step A: Register high-priority WifiNetworkSuggestion so Android auto-associates wlan0
-        registerWifiSuggestionForHotspot(ssid, passphrase)
-
-        // Step B: Also attempt legacy WifiConfiguration enable/reconnect if supported by ROM
-        try {
-            @Suppress("DEPRECATION")
-            val conf = android.net.wifi.WifiConfiguration().apply {
-                SSID = "\"$ssid\""
-                preSharedKey = "\"$passphrase\""
-            }
-            @Suppress("DEPRECATION")
-            val netId = wifiManager?.addNetwork(conf) ?: -1
-            if (netId != -1) {
-                @Suppress("DEPRECATION")
-                wifiManager?.enableNetwork(netId, true)
-            }
-            @Suppress("DEPRECATION")
-            wifiManager?.reconnect()
-        } catch (_: Throwable) {
-        }
-
-        // Step C: Poll for subnet reachability (192.168.137.x); if not yet associated after 2.5s on manual click,
-        //         fall back to WifiNetworkSpecifier requestNetwork.
-        var attempts = 0
-        var specifierRequested = false
-        val pollRunnable = object : Runnable {
-            override fun run() {
-                if (isSubnetAlreadyReachable(expectedGoIp)) {
-                    currentGoIp = expectedGoIp
-                    isConnectingOrConnected = true
-                    lastFailedSsid = null
-                    onLogMessage("[电脑热点已接通] 已获取直连子网地址，正在与 $expectedGoIp 握手...")
-                    onConnectedToGo(expectedGoIp, false)
-                    return
-                }
-                attempts++
-                if (attempts == 5 && isManualUserClick && !specifierRequested && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    specifierRequested = true
-                    requestWifiNetworkSpecifier(ssid, passphrase, expectedGoIp)
-                }
-                if (attempts < 28) {
-                    mainHandler.postDelayed(this, 500L)
-                } else {
-                    isConnectingOrConnected = false
-                    lastFailedSsid = ssid
-                    onLogMessage("[连接提示] 若系统首次连接电脑热点，请在Wi-Fi设置或弹窗中允许连接 $ssid (密码: $passphrase)")
-                }
-            }
-        }
-        mainHandler.postDelayed(pollRunnable, 400L)
-    }
-
-    private fun requestWifiNetworkSpecifier(ssid: String, passphrase: String, expectedGoIp: String) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-        val cm = connectivityManager ?: return
-        releaseSpecifierNetwork()
-        try {
-            val specifier = WifiNetworkSpecifier.Builder()
-                .setSsid(ssid)
-                .setWpa2Passphrase(passphrase)
-                .build()
-            val req = NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .setNetworkSpecifier(specifier)
-                .build()
-            val cb = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) {
-                    super.onAvailable(network)
-                    try {
-                        cm.bindProcessToNetwork(network)
-                    } catch (_: Throwable) {
-                    }
-                    currentGoIp = expectedGoIp
-                    isConnectingOrConnected = true
-                    lastFailedSsid = null
-                    mainHandler.post {
-                        onConnectedToGo(expectedGoIp, false)
-                    }
-                }
-
-                override fun onUnavailable() {
-                    super.onUnavailable()
-                    if (!isSubnetAlreadyReachable(expectedGoIp)) {
-                        isConnectingOrConnected = false
-                    }
-                }
-
-                override fun onLost(network: Network) {
-                    super.onLost(network)
-                    try {
-                        cm.bindProcessToNetwork(null)
-                    } catch (_: Throwable) {
-                    }
-                }
-            }
-            activeSpecifierCallback = cb
-            cm.requestNetwork(req, cb)
-        } catch (t: Throwable) {
-            Log.w(TAG, "requestWifiNetworkSpecifier failed: ${t.message}")
-        }
-    }
-
-    private fun releaseSpecifierNetwork() {
-        val cb = activeSpecifierCallback ?: return
-        activeSpecifierCallback = null
-        try {
-            connectivityManager?.bindProcessToNetwork(null)
-        } catch (_: Throwable) {
-        }
-        try {
-            connectivityManager?.unregisterNetworkCallback(cb)
-        } catch (_: Throwable) {
         }
     }
 
@@ -588,6 +429,10 @@ class WifiP2pBurstManager(
                     )
                 )
             }
+            Log.d(
+                TAG,
+                "scanResults=${results.size} direct=${results.count { (it.SSID ?: "").startsWith("DIRECT-") }} cp=${found.map { it.p2pSsid }}"
+            )
             if (found.isNotEmpty()) {
                 onDirectHotspotsScanned(found)
             }
@@ -601,7 +446,6 @@ class WifiP2pBurstManager(
      * returns to DEEP_IDLE power saving state.
      */
     fun teardownGroup() {
-        releaseSpecifierNetwork()
         val mgr = wifiP2pManager ?: return
         val ch = channel ?: return
 
@@ -746,11 +590,6 @@ class WifiP2pBurstManager(
                                 }
                                 onConnectedToGo(goIp, info.isGroupOwner)
                             } else {
-                                // Ignore p2p0 disconnected broadcasts if we are actively connected to Windows SoftAP (192.168.137.1) over wlan0!
-                                val activeIp = currentGoIp
-                                if (activeIp != null && isSubnetAlreadyReachable(activeIp)) {
-                                    return@requestConnectionInfo
-                                }
                                 if (activeGroupSsid != null || currentGoIp != null) {
                                     clearActiveState()
                                     onDisconnected()

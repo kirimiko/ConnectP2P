@@ -47,6 +47,33 @@ from protocol import (
 
 logger = logging.getLogger("ConnectP2P.WiFiDirect")
 
+_WINRT_PREAMBLE = r"""
+$ErrorActionPreference = 'Continue'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
+[void][Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+[void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+[void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+$asTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+Function Await($WinRtTask, $ResultType) {
+    $netTask = $asTaskGeneric.MakeGenericMethod($ResultType).Invoke($null, @($WinRtTask))
+    $netTask.Wait(8000) | Out-Null
+    return $netTask.Result
+}
+Function AwaitAction($WinRtAction) {
+    $netTask = $asTaskAction.Invoke($null, @($WinRtAction))
+    $netTask.Wait(8000) | Out-Null
+}
+Function Get-TetheringManager {
+    $p = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+    if ($null -eq $p) {
+        $p = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles() | Where-Object { $_.IsWlanConnectionProfile } | Select-Object -First 1
+    }
+    if ($null -eq $p) { return $null }
+    return [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($p)
+}
+"""
+
 
 @dataclass
 class P2pGroupCredentials:
@@ -55,6 +82,7 @@ class P2pGroupCredentials:
     go_ip: str
     port: int = DATA_TCP_PORT
     role: str = "GO"  # "GO" or "CLIENT"
+    hotspot_on: bool = True
 
 
 class WindowsWifiP2pController:
@@ -97,102 +125,90 @@ class WindowsWifiP2pController:
         target_ssid = ssid or encode_p2p_ssid(self.device_name)
         target_pass = passphrase or derive_p2p_passphrase(target_ssid)
 
-        # Emit READY immediately once Mobile Hotspot / Wi-Fi Direct is up so Python never blocks!
-        ready_script = f"""
-$ErrorActionPreference = 'Continue'
-try {{
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
-    [void][Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
-    [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
-    [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
-
-    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]
-    Function Await($WinRtTask, $ResultType) {{
-        $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-        $netTask = $asTask.Invoke($null, @($WinRtTask))
-        $netTask.Wait(6000) | Out-Null
-        return $netTask.Result
-    }}
-    $asTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' }})[0]
-    Function AwaitAction($WinRtAction) {{
-        $netTask = $asTaskAction.Invoke($null, @($WinRtAction))
-        $netTask.Wait(6000) | Out-Null
-    }}
-
-    $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-    if ($null -eq $profile) {{
-        $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles() | Select-Object -First 1
-    }}
-    if ($null -ne $profile) {{
-        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
-        if ($null -ne $tm) {{
-            if ($tm.TetheringOperationalState -ne 'On') {{
-                $cfg = New-Object Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration
-                $cfg.Ssid = '{target_ssid}'
-                $cfg.Passphrase = '{target_pass}'
-                try {{ AwaitAction ($tm.ConfigureAccessPointAsync($cfg)) }} catch {{}}
-                try {{ Await ($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]) | Out-Null }} catch {{}}
-            }}
-        }}
-    }}
-    Write-Output "READY:{target_ssid}:{target_pass}"
-}} catch {{
-    Write-Output "READY:{target_ssid}:{target_pass}"
+        # Windows Mobile Hotspot runs on the "Microsoft Wi-Fi Direct Virtual Adapter", so the primary
+        # WLAN connection stays up. Windows turns the hotspot off by itself after 5 min without clients
+        # unless the no-connections timeout is disabled.
+        body = f"""
+$tm = Get-TetheringManager
+if ($null -eq $tm) {{ Write-Output "RESULT:NoTetheringManager::"; return }}
+try {{ AwaitAction ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::DisableNoConnectionsTimeoutAsync()) }} catch {{}}
+if ($tm.TetheringOperationalState -ne 'On') {{
+    $cfg = New-Object Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration
+    $cfg.Ssid = '{target_ssid}'
+    $cfg.Passphrase = '{target_pass}'
+    try {{ AwaitAction ($tm.ConfigureAccessPointAsync($cfg)) }} catch {{}}
+    try {{
+        $r = Await ($tm.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+        if ($null -ne $r -and $r.Status -ne 'Success') {{ Write-Output "ERR:$($r.Status) $($r.AdditionalErrorMessage)" }}
+    }} catch {{ Write-Output "ERR:$($_.Exception.Message)" }}
 }}
+$cur = $tm.GetCurrentAccessPointConfiguration()
+Write-Output "RESULT:$($tm.TetheringOperationalState):$($cur.Ssid):$($cur.Passphrase)"
 """
-        logger.info("Starting on-demand Windows Wi-Fi Direct Autonomous GO: %s", target_ssid)
-        try:
-            res = subprocess.run(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    ready_script,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10.0,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            out = (res.stdout or "").strip()
-            if "READY:" in out:
-                go_ip = None
-                for _ in range(8):
-                    go_ip = self._detect_local_p2p_ip()
-                    if go_ip:
-                        break
-                    time.sleep(0.25)
-                go_ip = go_ip or WINDOWS_GO_DEFAULT_IP
-                creds = P2pGroupCredentials(
-                    ssid=target_ssid,
-                    passphrase=target_pass,
-                    go_ip=go_ip,
-                    port=port,
-                    role="GO",
-                )
-                with self._lock:
-                    self._ps_proc = None
-                    self._active_creds = creds
-                logger.info("Wi-Fi Direct GO ready at %s (SSID=%s)", go_ip, target_ssid)
-                return creds
-        except Exception as exc:
-            logger.warning("Failed to launch WinRT hotspot: %s", exc)
+        logger.info("Starting Windows Mobile Hotspot: %s", target_ssid)
+        out = self._run_winrt_script(body, timeout=20.0)
+        state, actual_ssid, actual_pass = "", target_ssid, target_pass
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("ERR:"):
+                logger.warning("Mobile Hotspot start error: %s", line[4:])
+            elif line.startswith("RESULT:"):
+                parts = line[len("RESULT:"):].split(":", 2)
+                state = parts[0] if parts else ""
+                if len(parts) >= 3 and parts[1]:
+                    actual_ssid, actual_pass = parts[1], parts[2]
 
-        # Fallback: return local IP + credentials so LAN / Virtual Wi-Fi Direct still works
-        fallback_ip = self._detect_local_p2p_ip() or self._detect_primary_lan_ip()
+        hotspot_on = state == "On"
+        go_ip = None
+        if hotspot_on:
+            for _ in range(12):
+                go_ip = self._detect_local_p2p_ip()
+                if go_ip:
+                    break
+                time.sleep(0.25)
         creds = P2pGroupCredentials(
-            ssid=target_ssid,
-            passphrase=target_pass,
-            go_ip=fallback_ip,
+            ssid=actual_ssid,
+            passphrase=actual_pass,
+            go_ip=go_ip or WINDOWS_GO_DEFAULT_IP,
             port=port,
             role="GO",
+            hotspot_on=hotspot_on,
         )
-        with self._lock:
-            self._active_creds = creds
+        if hotspot_on:
+            with self._lock:
+                self._active_creds = creds
+            logger.info("Mobile Hotspot ON at %s (SSID=%s)", creds.go_ip, actual_ssid)
+        else:
+            logger.warning("Mobile Hotspot did not turn on (state=%r)", state)
         return creds
+
+    def teardown_local_state(self) -> None:
+        with self._lock:
+            if self._active_creds is not None and self._active_creds.role == "GO":
+                self._active_creds = None
+
+    def is_hotspot_on(self) -> bool:
+        out = self._run_winrt_script(
+            '$tm = Get-TetheringManager\nif ($null -ne $tm) { Write-Output "STATE:$($tm.TetheringOperationalState)" }',
+            timeout=10.0,
+        )
+        return "STATE:On" in out
+
+    @staticmethod
+    def _run_winrt_script(body: str, timeout: float = 15.0) -> str:
+        script = _WINRT_PREAMBLE + "\ntry {\n" + body + "\n} catch { Write-Output \"ERR:$($_.Exception.Message)\" }\n"
+        try:
+            res = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return res.stdout or ""
+        except Exception as exc:
+            logger.warning("WinRT PowerShell call failed: %s", exc)
+            return ""
 
     def connect_to_android_group(
         self,
@@ -332,34 +348,16 @@ try {{
 
         if creds and creds.role == "GO":
             logger.info("Stopping Windows Mobile Hotspot...")
-            stop_script = """
-$ErrorActionPreference = 'Continue'
-try {
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
-    [void][Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
-    [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
-    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
-    $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-    if ($null -ne $profile) {
-        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
-        if ($null -ne $tm -and $tm.TetheringOperationalState -eq 'On') {
-            $asTask = $asTaskGeneric.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
-            $netTask = $asTask.Invoke($null, @($tm.StopTetheringAsync()))
-            $netTask.Wait(4000) | Out-Null
-        }
-    }
-} catch {}
-"""
-            try:
-                subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", stop_script],
-                    capture_output=True,
-                    text=True,
-                    timeout=5.0,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except Exception:
-                pass
+            self._run_winrt_script(
+                """
+$tm = Get-TetheringManager
+if ($null -ne $tm -and $tm.TetheringOperationalState -eq 'On') {
+    Await ($tm.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]) | Out-Null
+}
+try { AwaitAction ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::EnableNoConnectionsTimeoutAsync()) } catch {}
+""",
+                timeout=12.0,
+            )
 
         if creds:
             logger.info("Wi-Fi P2P link torn down (%s). Entered DEEP_IDLE state.", creds.ssid)

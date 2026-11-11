@@ -185,6 +185,10 @@ class ConnectP2pWindowsNode:
 
         self._p2p_ready_event = threading.Event()
         self._liveness_thread: Optional[threading.Thread] = None
+        self._hotspot_thread: Optional[threading.Thread] = None
+        self._hotspot_wanted = False
+        self._hotspot_creds: Optional[P2pGroupCredentials] = None
+        self._last_clip_send: Optional[tuple] = None
         self._running = False
 
     def start(self) -> None:
@@ -217,6 +221,7 @@ class ConnectP2pWindowsNode:
                 except Exception:
                     pass
         self.clipboard.stop()
+        self._hotspot_wanted = False
         self.p2p_controller.teardown()
         self.control.stop()
         self.transport.stop_server()
@@ -289,13 +294,7 @@ class ConnectP2pWindowsNode:
             try:
                 hello_frame = encode_frame(
                     FrameType.HELLO,
-                    {
-                        "device_id": self.device_id,
-                        "device_name": self.device_name,
-                        "platform": "windows",
-                        "data_port": self.transport.bound_port,
-                        "timestamp": int(time.time() * 1000),
-                    },
+                    self.control._hello_header(is_reply=False),
                 )
                 self.transport.send_control_frame_over_tcp(
                     arp_ip,
@@ -421,6 +420,9 @@ class ConnectP2pWindowsNode:
         )
         self.transport.send_control_frame_over_tcp(dest_ip, resp_frame, target_port=peer.data_port)
 
+        was_connected = peer.is_connected and self.connected_peer is not None and self.connected_peer.device_id == peer.device_id
+        if accepted and was_connected:
+            return
         if accepted:
             self._manually_disconnected = False
             self.manually_disconnected_ids.discard(peer.device_id)
@@ -472,8 +474,7 @@ class ConnectP2pWindowsNode:
             self.connected_peer = remaining[0] if remaining else None
 
         if self.connected_peer is None:
-            self._manually_disconnected = True
-            self.p2p_controller.teardown()
+            self._teardown_client_link()
             self.watchdog.force_idle_now()
 
         if self.on_connected_peer_change:
@@ -482,6 +483,12 @@ class ConnectP2pWindowsNode:
             self.on_peers_updated(list(self.control.peers.values()))
 
         self._emit_log(f"[已单独断开设备] 已断开与 {peer.device_name} 的连接 (双击列表可随时重连)")
+
+    def _teardown_client_link(self) -> None:
+        """Drop a laptop-as-client link to a phone group, but keep this PC's own hotspot up for reconnects."""
+        creds = self.p2p_controller.active_credentials
+        if creds is not None and creds.role == "CLIENT":
+            self.p2p_controller.teardown()
 
     def disconnect_current_peer(self, forget_trust: bool = False) -> None:
         """
@@ -495,13 +502,13 @@ class ConnectP2pWindowsNode:
             p.is_connected = False
             self.manually_disconnected_ids.add(p.device_id)
         self.connected_peer = None
-        self.p2p_controller.teardown()
+        self._teardown_client_link()
         self.watchdog.force_idle_now()
         if self.on_connected_peer_change:
             self.on_connected_peer_change(None)
         if self.on_peers_updated:
             self.on_peers_updated(list(self.control.peers.values()))
-        self._emit_log("[已手动断开连接] 当前无活动设备连接，Wi-Fi P2P 已关闭")
+        self._emit_log("[已手动断开连接] 当前无活动设备连接")
 
     def start_p2p_group_on_demand(self) -> P2pGroupCredentials:
         """
@@ -509,60 +516,66 @@ class ConnectP2pWindowsNode:
         Uses deterministic SSID/Passphrase so Android phones can scan and 1-tap connect without typing!
         """
         self._manually_disconnected = False
-        self.watchdog.set_state(PowerState.P2P_HANDSHAKE)
+        self._hotspot_wanted = True
         creds = self.p2p_controller.start_autonomous_group_owner(port=self.transport.bound_port)
-        self.watchdog.set_state(PowerState.P2P_BURST_ACTIVE)
-        # Allow 120s for peer discovery when hotspot is first started; file transfers reset to idle_timeout_sec
-        self.watchdog.touch_activity(timeout_sec=max(120.0, self.watchdog.idle_timeout_sec))
-        self.control.send_p2p_group_ready(
-            ssid=creds.ssid,
-            passphrase=creds.passphrase,
-            go_ip=creds.go_ip,
-            port=creds.port,
-        )
-        threading.Thread(
-            target=self._probe_hotspot_arp_clients_loop,
-            daemon=True,
-        ).start()
-        self._emit_log(
-            f"[本机直连热点已开启] 手机点击『扫描周围设备』即可看到 \"{self.device_name}\" 一键免密连接 (SSID={creds.ssid})"
-        )
+        self._hotspot_creds = creds
+        if creds.hotspot_on:
+            self.control.hotspot_info = {"ssid": creds.ssid, "passphrase": creds.passphrase, "go_ip": creds.go_ip}
+            self.control.send_p2p_group_ready(
+                ssid=creds.ssid,
+                passphrase=creds.passphrase,
+                go_ip=creds.go_ip,
+                port=creds.port,
+            )
+            self._emit_log(
+                f"[本机直连热点已开启] SSID={creds.ssid} ({creds.go_ip})，电脑主 Wi-Fi 不受影响；手机端点击该电脑即可连接"
+            )
+        else:
+            self._emit_log("[热点开启失败] Windows 移动热点未能开启（请确认 Wi-Fi 已打开，且系统设置里的『移动热点』可手动开启）")
+        if self._hotspot_thread is None or not self._hotspot_thread.is_alive():
+            self._hotspot_thread = threading.Thread(
+                target=self._hotspot_keepalive_loop,
+                name="ConnectP2PHotspotKeepalive",
+                daemon=True,
+            )
+            self._hotspot_thread.start()
         return creds
 
-    def _probe_hotspot_arp_clients_loop(self) -> None:
+    def stop_hotspot(self) -> None:
+        self._hotspot_wanted = False
+        self.control.hotspot_info = None
+        self.p2p_controller.teardown()
+        self._emit_log("[热点已关闭] Windows 移动热点已关闭")
+
+    def _hotspot_keepalive_loop(self) -> None:
         """
-        When Windows Mobile Hotspot (192.168.137.1) is started, watch ARP for newly associated
-        Android clients (192.168.137.x) and immediately announce presence over UDP & TCP so
-        cross-network discovery succeeds in < 1 second even if UDP broadcast is filtered.
+        Keeps the Mobile Hotspot up while it is wanted (Windows may stop it when the laptop's
+        Wi-Fi roams or the adapter resets), and announces this PC to hotspot clients that have
+        not been seen yet. Windows ICS keeps client ARP entries as "static", so ARP alone cannot
+        tell whether a client is still associated; unicast HELLO is cheap enough to repeat.
         """
-        seen_arp_ips: set[str] = set()
-        for _ in range(40):
-            if not self._running or not self.p2p_controller.is_active:
+        last_state_check = time.time()
+        while self._running and self._hotspot_wanted:
+            time.sleep(10.0)
+            if not self._running or not self._hotspot_wanted:
                 break
             try:
+                connected_ips = {p.ip for p in self.control.peers.values() if p.is_connected and p.ip}
                 for arp_ip in self.control._get_arp_hotspot_peers():
-                    if arp_ip not in seen_arp_ips:
-                        seen_arp_ips.add(arp_ip)
+                    if arp_ip.startswith("192.168.137.") and arp_ip not in connected_ips:
                         self.control.announce_presence_once(target_ip=arp_ip)
-                        hello_frame = encode_frame(
-                            FrameType.HELLO,
-                            {
-                                "device_id": self.device_id,
-                                "device_name": self.device_name,
-                                "platform": "windows",
-                                "data_port": self.transport.bound_port,
-                                "timestamp": int(time.time() * 1000),
-                            },
-                        )
-                        self.transport.send_control_frame_over_tcp(
-                            arp_ip,
-                            hello_frame,
-                            target_port=DATA_TCP_PORT,
-                            timeout=1.0,
-                        )
             except Exception:
                 pass
-            time.sleep(1.5)
+            if time.time() - last_state_check >= 60.0:
+                last_state_check = time.time()
+                if not self.p2p_controller.is_hotspot_on():
+                    self._emit_log("[热点保活] 检测到 Windows 移动热点被系统关闭，正在自动重新开启...")
+                    self.p2p_controller.teardown_local_state()
+                    creds = self.p2p_controller.start_autonomous_group_owner(port=self.transport.bound_port)
+                    if creds.hotspot_on:
+                        self._hotspot_creds = creds
+                        self.control.hotspot_info = {"ssid": creds.ssid, "passphrase": creds.passphrase, "go_ip": creds.go_ip}
+                        self._emit_log(f"[热点保活] 已重新开启 {creds.ssid}")
 
     def connect_to_android_p2p_group(
         self,
@@ -616,6 +629,13 @@ class ConnectP2pWindowsNode:
 
         if not dest_ip:
             return False
+
+        # Connect handshakes arrive over both UDP and TCP and each one triggers a sync; send a clip once.
+        clip_key = (dest_ip, hash(text))
+        now = time.time()
+        if self._last_clip_send and self._last_clip_send[0] == clip_key and now - self._last_clip_send[1] < 3.0:
+            return True
+        self._last_clip_send = (clip_key, now)
 
         dest_port = resolved_peer.data_port if resolved_peer else DATA_TCP_PORT
         payload_len = len(text.encode("utf-8"))
@@ -861,20 +881,13 @@ class ConnectP2pWindowsNode:
             data_port=remote_port,
             discovery_source="lan",
         )
-        self.control.upsert_discovered_peer(peer)
+        self.control.upsert_discovered_peer(peer, notify=ftype != FrameType.P2P_TEARDOWN)
         stored_peer = self.control.peers.get(remote_id) or peer
         if ftype == FrameType.HELLO:
             if not header.get("is_reply"):
                 reply_frame = encode_frame(
                     FrameType.HELLO,
-                    {
-                        "device_id": self.device_id,
-                        "device_name": self.device_name,
-                        "platform": "windows",
-                        "data_port": self.transport.bound_port,
-                        "is_reply": True,
-                        "timestamp": int(time.time() * 1000),
-                    },
+                    self.control._hello_header(is_reply=True),
                 )
                 self.control.announce_presence_once(target_ip=sender_ip)
                 self.transport.send_control_frame_over_tcp(
@@ -956,16 +969,16 @@ class ConnectP2pWindowsNode:
             self.on_power_state_change(state)
 
     def _handle_idle_teardown(self) -> None:
-        if self.p2p_controller.is_active:
-            has_active_p2p_peer = any(
-                p.is_connected and p.ip and (p.ip.startswith("192.168.137.") or p.ip.startswith("192.168.49."))
-                for p in self.control.peers.values()
-            )
-            if has_active_p2p_peer:
-                self._emit_log("[空闲自动降功耗] 文件传输已完成，已回归 DEEP_IDLE 超低功耗监听态 (保持直连通道在线)")
-                return
+        creds = self.p2p_controller.active_credentials
+        if creds is None or creds.role != "CLIENT":
+            return
+        has_active_p2p_peer = any(
+            p.is_connected and p.ip and p.ip.startswith("192.168.49.")
+            for p in self.control.peers.values()
+        )
+        if not has_active_p2p_peer:
             self.p2p_controller.teardown()
-            self._emit_log("[空闲自动降功耗] 热点无活动连接设备，已自动关闭 Wi-Fi 热点回到超低功耗待机")
+            self._emit_log("[空闲自动降功耗] 已断开电脑到手机热点的临时连接")
 
     def _emit_log(self, msg: str) -> None:
         logger.info(msg)

@@ -40,6 +40,14 @@ class ClipboardSyncHelper(
     }
 
     fun start() {
+        // Baseline = whatever is already on the clipboard, so only text copied from now on is pushed.
+        try {
+            clipboardManager.primaryClip?.takeIf { it.itemCount > 0 }
+                ?.getItemAt(0)?.coerceToText(appContext)?.toString()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { lastAppliedHash = P2pProtocol.computeClipHash(it.toByteArray(StandardCharsets.UTF_8)) }
+        } catch (_: Exception) {
+        }
         clipboardManager.addPrimaryClipChangedListener(clipListener)
     }
 
