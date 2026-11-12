@@ -22,7 +22,10 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -138,9 +141,11 @@ class BleLowPowerChannel(
     private val reassemblyTotals = ConcurrentHashMap<String, Int>()
 
     fun startLowPowerChannel() {
+        registerAdapterStateReceiver()
+        scheduleHealthCheck()
         val adapter = bluetoothAdapter ?: return
         if (!adapter.isEnabled) {
-            Log.i(TAG, "Bluetooth disabled; BLE low-power wake channel skipped")
+            Log.i(TAG, "Bluetooth disabled; BLE channel starts when it is turned on")
             return
         }
         setupGattServer()
@@ -149,6 +154,15 @@ class BleLowPowerChannel(
     }
 
     fun stopLowPowerChannel() {
+        channelStopped = true
+        mainHandler.removeCallbacks(healthCheck)
+        if (adapterReceiverRegistered) {
+            try {
+                context.applicationContext.unregisterReceiver(adapterStateReceiver)
+            } catch (_: Exception) {
+            }
+            adapterReceiverRegistered = false
+        }
         stopLowPowerScan()
         stopLowPowerAdvertising()
         try {
@@ -160,6 +174,86 @@ class BleLowPowerChannel(
         subscribedCentrals.clear()
         notifyQueues.clear()
         notifyInFlight.clear()
+    }
+
+    @Volatile
+    private var channelStopped = false
+    private var adapterReceiverRegistered = false
+
+    /**
+     * Turning Bluetooth off (Quick Settings, OEM power savers, a stack restart) silently destroys our GATT
+     * server and advertising set; nothing tells the app to recreate them. Rebuild everything on STATE_ON.
+     */
+    private val adapterStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                    Log.i(TAG, "Bluetooth turning off; dropping BLE channel state")
+                    resetAfterAdapterLoss()
+                }
+                BluetoothAdapter.STATE_ON -> {
+                    Log.i(TAG, "Bluetooth on; rebuilding GATT server and advertising")
+                    resetAfterAdapterLoss()
+                    if (!channelStopped) startLowPowerChannel()
+                }
+            }
+        }
+    }
+
+    private fun registerAdapterStateReceiver() {
+        if (adapterReceiverRegistered) return
+        channelStopped = false
+        try {
+            context.applicationContext.registerReceiver(
+                adapterStateReceiver,
+                IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            )
+            adapterReceiverRegistered = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not watch Bluetooth state: ${e.message}")
+        }
+    }
+
+    private fun resetAfterAdapterLoss() {
+        val lost = subscribedCentrals.keys.toList()
+        subscribedCentrals.clear()
+        centralMtu.clear()
+        notifyQueues.clear()
+        notifyInFlight.clear()
+        reassemblyBuffers.clear()
+        reassemblyTotals.clear()
+        try {
+            gattServer?.close()
+        } catch (_: Exception) {
+        }
+        gattServer = null
+        controlCharacteristic = null
+        advertiser = null
+        scanner = null
+        isAdvertising = false
+        isScanning = false
+        lost.forEach { onCentralLinkChanged(it, false) }
+    }
+
+    /** Safety net in case a state broadcast is missed or advertising failed to start. */
+    private val healthCheck = object : Runnable {
+        override fun run() {
+            if (channelStopped) return
+            if (bluetoothAdapter?.isEnabled == true && (gattServer == null || !isAdvertising)) {
+                Log.i(TAG, "BLE channel incomplete (server=${gattServer != null}, advertising=$isAdvertising); restarting")
+                if (gattServer == null) resetAfterAdapterLoss()
+                setupGattServer()
+                startLowPowerAdvertising()
+                startHardwareFilteredLowPowerScan()
+            }
+            mainHandler.postDelayed(this, 60_000L)
+        }
+    }
+
+    private fun scheduleHealthCheck() {
+        mainHandler.removeCallbacks(healthCheck)
+        mainHandler.postDelayed(healthCheck, 60_000L)
     }
 
     fun onScreenInteractiveChanged(interactive: Boolean) {

@@ -49,6 +49,7 @@ class BleCentralLink:
         self.ping_frame = ping_frame
         self._last_rx: Dict[str, float] = {}
         self._last_ping: Dict[str, float] = {}
+        self._retry_after: Dict[str, float] = {}
         self._clients: Dict[str, Any] = {}
         self._write_locks: Dict[str, asyncio.Lock] = {}
         self._reassemblers: Dict[str, BleChunkReassembler] = {}
@@ -133,7 +134,11 @@ class BleCentralLink:
                 found = await BleakScanner.discover(  # type: ignore[union-attr]
                     timeout=_SCAN_SECONDS, service_uuids=[BLE_SERVICE_UUID], return_adv=True
                 )
-                new = [d for a, (d, _adv) in found.items() if not self.is_linked(a)]
+                now = asyncio.get_running_loop().time()
+                new = [
+                    d for a, (d, _adv) in found.items()
+                    if not self.is_linked(a) and self._retry_after.get(a, 0.0) <= now
+                ]
                 if new:
                     logger.info(
                         "BLE scan found %s in %.1fs",
@@ -192,6 +197,9 @@ class BleCentralLink:
             self._dispatch.submit(self._safe_call, self.on_link_change, address, True)
         except Exception as exc:
             logger.info("BLE connect to %s failed: %s", address, exc)
+            # A linked phone keeps advertising under rotating random addresses, and connecting to those
+            # fails after the full timeout; don't stall the scan loop on them.
+            self._retry_after[address] = loop.time() + (300.0 if self._clients else 10.0)
             self._clients.pop(address, None)
             try:
                 await client.disconnect()
