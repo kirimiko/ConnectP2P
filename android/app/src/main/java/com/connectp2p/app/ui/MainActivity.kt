@@ -127,11 +127,13 @@ class MainActivity : Activity(), P2pTransferService.ServiceUiCallback {
                 val icon = if (peer.platform == "android") "📱" else "💻"
                 val star = if (isTrusted) "★" else "[陌生] "
 
+                val link = peer.ip ?: if (peer.bleAddress != null && peer.isConnected) "蓝牙" else null
                 val statusText = when {
-                    isTarget -> "🎯 当前目标 (已连接 ${peer.ip ?: "直连"}) · 长按可取消信任"
-                    peer.isConnected -> "✅ 已连接 (${peer.ip ?: "直连"}) · 点击设为目标"
+                    isTarget -> "🎯 当前目标 (已连接 ${link ?: "直连"}) · 长按可取消信任"
+                    peer.isConnected -> "✅ 已连接 (${link ?: "直连"}) · 点击设为目标"
                     isTrusted -> "⚪ 已断开 (${peer.ip ?: "待连接"}) · ★已信任设备"
                     peer.discoverySource == "p2p_scan" -> "⚪ 陌生设备 · Wi-Fi直连热点"
+                    peer.discoverySource == "ble_adv" -> "⚪ 附近的手机 (蓝牙) · 连接需对方同意"
                     else -> "⚪ 陌生设备 (${peer.ip ?: "待连接"}) · 连接需对方同意"
                 }
 
@@ -474,7 +476,7 @@ class MainActivity : Activity(), P2pTransferService.ServiceUiCallback {
         runOnUiThread {
             if (peer != null) {
                 val icon = if (peer.platform == "android") "📱" else "💻"
-                tvConnectedPeer.text = "🎯 当前指定目标: $icon ${peer.deviceName} (${peer.ip ?: "直连中"}) — 定向发文件 & 剪贴板同步中"
+                tvConnectedPeer.text = "🎯 当前指定目标: $icon ${peer.deviceName} (${peer.ip ?: if (transferService?.isBleLinked(peer) == true) "蓝牙" else "直连中"}) — 定向发文件 & 剪贴板同步中"
                 tvConnectedPeer.setTextColor(0xFF005FB8.toInt())
                 peer.ip?.let { etTargetIp.setText(it) }
             } else {
@@ -564,7 +566,8 @@ class MainActivity : Activity(), P2pTransferService.ServiceUiCallback {
 
     private fun copyUriToTempFile(uri: Uri): File? {
         return try {
-            var displayName = "shared_${System.currentTimeMillis()}.bin"
+            var displayName = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.contains('.') }
+                ?: "shared_${System.currentTimeMillis()}.bin"
             contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (nameIdx >= 0 && cursor.moveToFirst()) {

@@ -107,6 +107,10 @@ object P2pProtocol {
     const val BLE_SERVICE_UUID = "0000c0de-0000-1000-8000-00805f9b34fb"
     const val BLE_CONTROL_CHAR_UUID = "0000c0df-0000-1000-8000-00805f9b34fb"
     const val BLE_CLIPBOARD_CHAR_UUID = "0000c0e0-0000-1000-8000-00805f9b34fb"
+    /** Scan-response service data: the device's display name (UTF-8, truncated). */
+    const val BLE_NAME_DATA_UUID = "0000c0e1-0000-1000-8000-00805f9b34fb"
+    /** Advertisement service data under BLE_SERVICE_UUID: [version][platform][4-byte device id hash]. */
+    const val BLE_AD_VERSION: Byte = 1
 
     const val MAX_INLINE_CLIPBOARD_BYTES = 16384 // <= 16KB syncs via low-power BLE/UDP without waking Wi-Fi P2P
     const val BLE_MTU_CHUNK_SIZE = 480
@@ -231,6 +235,12 @@ object P2pProtocol {
         }
         return s to false
     }
+
+    /** 4-byte identity carried in BLE advertisements; lets phones recognize trusted peers before connecting. */
+    fun bleIdHashBytes(deviceId: String): ByteArray =
+        MessageDigest.getInstance("SHA-256").digest(deviceId.toByteArray(StandardCharsets.UTF_8)).copyOf(4)
+
+    fun bleIdHash(deviceId: String): String = bytesToHex(bleIdHashBytes(deviceId))
 
     fun computeClipHash(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes)

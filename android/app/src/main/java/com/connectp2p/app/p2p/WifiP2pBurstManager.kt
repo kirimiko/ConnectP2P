@@ -26,7 +26,8 @@ class WifiP2pBurstManager(
     private val onPeersDiscovered: (List<WifiP2pDevice>) -> Unit,
     private val onDirectHotspotsScanned: (List<P2pProtocol.PeerInfo>) -> Unit = {},
     private val onDisconnected: () -> Unit,
-    private val onLogMessage: (String) -> Unit = {}
+    private val onLogMessage: (String) -> Unit = {},
+    private val onGroupClientsLeft: () -> Unit = {}
 ) {
     companion object {
         private const val TAG = "ConnectP2P.WifiP2p"
@@ -65,6 +66,9 @@ class WifiP2pBurstManager(
 
     @Volatile
     private var lastScanParseTimeMs: Long = 0L
+
+    @Volatile
+    private var goHadClients: Boolean = false
 
     fun initialize() {
         try {
@@ -488,6 +492,7 @@ class WifiP2pBurstManager(
         activeGroupPassphrase = null
         currentGoIp = null
         isConnectingOrConnected = false
+        goHadClients = false
     }
 
     private fun requestGroupCredentialsWithRetry(
@@ -587,8 +592,23 @@ class WifiP2pBurstManager(
                                 currentGoIp = goIp
                                 if (info.isGroupOwner) {
                                     requestGroupCredentialsWithRetry()
+                                    // The GO also gets CONNECTION_CHANGED when a client leaves; that must not
+                                    // look like a new link (it would keep an empty group alive).
+                                    mgr.requestGroupInfo(ch) { group ->
+                                        val hasClients = group?.clientList?.isNotEmpty() == true
+                                        if (hasClients) {
+                                            goHadClients = true
+                                            onConnectedToGo(goIp, true)
+                                        } else if (goHadClients) {
+                                            goHadClients = false
+                                            onGroupClientsLeft()
+                                        } else {
+                                            onConnectedToGo(goIp, true)
+                                        }
+                                    }
+                                } else {
+                                    onConnectedToGo(goIp, false)
                                 }
-                                onConnectedToGo(goIp, info.isGroupOwner)
                             } else {
                                 if (activeGroupSsid != null || currentGoIp != null) {
                                     clearActiveState()
